@@ -1,0 +1,127 @@
+# 一加 Ace 5 (OnePlus Ace 5 / 13R) AERA Recovery 适配说明与修改清单
+
+本说明记录了一加 Ace 5（中国版代号 `giuliac` / 型号 `PKG110`，海外对应 OnePlus 13R 代号 `giulia` / 型号 `CPH2645`、`CPH2647`、`CPH2691`）基于一加 12（`waffle`）AERA Recovery 官方设备树进行深度适配的完整技术细节与修改清单。
+
+---
+
+## 一、 硬件与平台对比
+
+| 参数项 | 一加 12 (`waffle`) | 一加 Ace 5 (`giuliac` / `giulia`) | 适配处理策略 |
+| :--- | :--- | :--- | :--- |
+| **SoC 芯片** | 骁龙 8 Gen 3 (`SM8650` / `pineapple`) | 骁龙 8 Gen 3 (`SM8650` / `pineapple`) | **完全复用**：CPU 调度、架构配置与 Adreno 750 用户态驱动一致 |
+| **屏幕尺寸与规格** | 6.82 英寸 2K 曲面屏 (3168 × 1440) | 6.78 英寸 1.5K 直屏 (2780 × 1264) | **针对性重构**：修改 LVGL 渲染高度与状态栏边距，避免 UI 变形 |
+| **动态分区结构** | ColorOS A/B (Super + OPLUS 子分区) | ColorOS A/B (Super + OPLUS 子分区) | **完全复用**：`my_product`, `my_heytap`, `my_bigball` 等结构一致 |
+| **加密与解密** | 高通 FBE v2 + Wrappedkey | 高通 FBE v2 + Wrappedkey | **完全复用**：沿用 SM8650 vold/crypto 密钥派生链 |
+| **机型识别机制** | 单一硬编码 (`waffle`) | 动态 `libinit` 读取 `ro.boot.prjname` | **新增架构**：动态识别 `23851` (Ace 5) 与 `23867~23869` (13R) |
+
+---
+
+## 二、 相较于一加 12 的完整修改清单
+
+### 1. 屏幕与 LVGL UI 参数重构
+* **重命名文件**：`aera_waffle.mk` $\to$ `aera_giulia.mk`
+* **修改细节**：
+  * `AERA_SCREEN_H := 2780`（原一加 12 为 `2376`）：重置 LVGL 画布在 1.5K（2780 × 1264）物理面板下的基准高度。
+  * `AERA_STATUS_H := 115`（原一加 12 为 `120`）：适配 Ace 5 挖孔屏顶部安全距离。
+  * `AERA_STATUS_INDENT_LEFT := 40`、`AERA_STATUS_INDENT_RIGHT := 40`（原为 `50 / 30`）：针对直屏对称窄边框重新平衡顶部状态栏图标边距。
+
+### 2. 引入底层硬件动态识别库 (`libinit`)
+* **新增模块目录**：`libinit/`
+* **新增文件**：
+  * `libinit/Android.bp`：注册 `libinit_oplus_sm86xx` 静态库，支持 Recovery 环境加载。
+  * `libinit/libinit_oplus_sm86xx.cpp`：
+    * 捕获内核启动命令行参数 `oplus_region` 获取地区代码。
+    * 解析引导加载程序传入的工程项目代号 `ro.boot.prjname`：
+      * **`23851`**：精确匹配 **OnePlus Ace 5 (PKG110 / OP5D2BL1)**。
+      * **`23867` / `23868` / `23869`**：精确匹配 **OnePlus 13R (CPH2691 / CPH2645 / CPH2647)**。
+    * 在 init 阶段通过 `__system_property_update` / `__system_property_add` 强制覆写只读属性（如 `ro.product.model`、`ro.product.device`、`ro.twrp.device_version` 等），防止刷机包 Assert 脚本误判拦截。
+    * 将默认 Fallback 机型指定为 OnePlus Ace 5。
+
+### 3. 底层主板构建配置调整 (`BoardConfig.mk`)
+* **修改细节**：
+  * `DEVICE_PATH := device/oneplus/giulia`（原为 `device/oneplus/waffle`）。
+  * 引入 `TARGET_INIT_VENDOR_LIB := //$(DEVICE_PATH):libinit_oplus_sm86xx`，在构建 Recovery Ramdisk 时将 `libinit` 链接进二进制。
+  * 添加 `TARGET_RECOVERY_DEVICE_MODULES += libinit_oplus_sm86xx`。
+  * `AERA_DEVICE_VERSION := OnePlus_Ace_5`。
+  * 保留高通 FBE v2 解密模块、Adreno 750 用户态驱动以及动态分区参数。
+
+### 4. 产品定义与编译树入口
+* **重命名文件**：`twrp_waffle.mk` $\to$ `twrp_giulia.mk`
+  * 目标设备修改为 `PRODUCT_DEVICE := giulia`
+  * 产品名称修改为 `PRODUCT_NAME := twrp_giulia`
+  * 品牌与型号修改为 `PRODUCT_BRAND := OnePlus`、`PRODUCT_MODEL := OnePlus Ace 5`
+  * 继承路径更新为 `$(call inherit-product, device/oneplus/giulia/device.mk)`
+* **更新 `device.mk`**：
+  * `LOCAL_PATH := device/oneplus/giulia`
+  * 继承 `$(call inherit-product, $(LOCAL_PATH)/aera_giulia.mk)`
+* **更新 `AndroidProducts.mk`**：
+  * 导出产品描述文件 `$(LOCAL_DIR)/twrp_giulia.mk`
+  * 导出 lunch 选项：`twrp_giulia-user`、`twrp_giulia-userdebug`、`twrp_giulia-eng`
+* **更新 `Android.mk`**：
+  * 修改判定宏为 `ifneq ($(filter giulia giuliac,$(TARGET_DEVICE)),)`，同时支持 `giulia` 与 `giuliac` 目标。
+
+### 5. 终端环境变量与刷机白名单 (`vendorsetup.sh`)
+* **修改细节**：
+  * 目标设备宏修改为 `FDEVICE="giulia"`，判定逻辑兼容 `giuliac`。
+  * 环境变量 `TARGET_DEVICE_ALT` 更新为：
+    ```bash
+    export TARGET_DEVICE_ALT="PKG110,CPH2645,CPH2647,CPH2691,OP5D2BL1,OP5D3BL1,giulia,giuliac"
+    export AERA_TARGET_DEVICES="$TARGET_DEVICE_ALT"
+    ```
+  * 确保无论是中国版固件刷入，还是国际版 OTA 包，均能被设备识别放行。
+
+### 6. 云端 CI 自动化工作流 (`.github/workflows/build.yml`)
+* **修改细节**：
+  * 默认设备路径参数更新为：`DEVICE_PATH: default: "oneplus/giulia"`
+  * 默认设备名称更新为：`DEVICE_NAME: default: "giulia"`
+  * 默认 Lunch 目标更新为：`LUNCH_TARGET: default: "giulia"`
+  * 在 GitHub Actions 页面直接点击 **Run workflow** 即可一键自动拉取并构建 Ace 5 专属 recovery。
+
+### 7. 说明文档 (`README.md`)
+* 重写了设备规格参数表（1.5K 屏幕、Adreno 750、ColorOS 15、代号区分说明）。
+* 明确了本地构建指令（`lunch twrp_giulia-eng`）与支持的 Root 方案（KernelSU / APatch / Magisk）。
+
+---
+
+## 三、 本地与云端构建指引
+
+### 1. 本地 Linux / WSL 构建步骤
+```bash
+# 1. 准备源码环境
+mkdir -p ~/android/AERA_16.0 && cd ~/android/AERA_16.0
+repo init -u https://github.com/AERA-Recovery/android_manifest -b aera-16.0
+repo sync -c -j$(nproc --all)
+
+# 2. 拉取此设备树至 device/oneplus/giulia
+git clone https://github.com/cheng343/android_device_oneplus_giulia-AERA.git device/oneplus/giulia
+
+# 3. 初始化编译变量并编译
+source build/envsetup.sh
+lunch twrp_giulia-eng
+mka recoveryimage -j$(nproc --all)
+```
+编译成功后，产物位于 `out/target/product/giulia/recovery.img`。
+
+### 2. GitHub Actions 云端构建
+1. 访问已推送的仓库：[cheng343/android_device_oneplus_giulia-AERA](https://github.com/cheng343/android_device_oneplus_giulia-AERA)
+2. 进入 **Actions** 标签页，在左侧选择 **TWRP 16 Builder** 工作流。
+3. 点击 **Run workflow**，使用默认参数直接运行。
+4. 构建完成后，在 Workflow Run 详情页底部的 **Artifacts** 处下载打包生成的 `recovery.img`。
+
+---
+
+## 四、 刷入与测试步骤
+
+对于出厂搭载 Android 15 (Virtual A/B) 的一加 Ace 5：
+
+```bash
+# 1. 进入 Fastboot / Bootloader 模式
+adb reboot bootloader
+
+# 2. 临时测试引导 (推荐先用 boot 验证触控与解密)
+fastboot boot recovery.img
+
+# 3. 永久刷入 (确认功能正常后刷入)
+fastboot flash recovery recovery.img
+fastboot reboot recovery
+```
