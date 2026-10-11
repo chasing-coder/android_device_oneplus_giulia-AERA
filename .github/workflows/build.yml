@@ -86,12 +86,25 @@ jobs:
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
       with:
-        # The build volume is carved out of a loop file that lives on the ROOT
-        # filesystem, so every MB not reserved here is taken away from "/".
-        # When "/" fills up GitHub kills the runner and the job ends with ZERO
-        # logs (runs #5 and #7 died exactly like that at ~48 min).
-        root-reserve-mb: 8192
-        temp-reserve-mb: 10240
+        # Measured on this runner image (ubuntu-24.04, westus3): /mnt is NOT a
+        # separate disk, it lives on /dev/root, which is 145G with ~135G free
+        # after the cleanup step. maximize-build-space therefore does:
+        #   root_pv = free(/) - root-reserve-mb
+        #   avail(/mnt) is now exactly root-reserve-mb
+        #   temp_pv = root-reserve-mb - temp-reserve-mb   <-- so root-reserve-mb
+        #                                                      MUST exceed
+        #                                                      temp-reserve-mb,
+        #                                                      otherwise fallocate
+        #                                                      gets a negative size
+        #                                                      (run #8 died here)
+        #   build_lv = free(/) - temp-reserve-mb - swap-size-mb
+        #   free space left on / afterwards == temp-reserve-mb
+        # So temp-reserve-mb is the real root-fs headroom (the action's defaults
+        # left only 100MB, which is what killed runs #5 and #7 at ~48 min: the
+        # runner silently ran out of space and GitHub discarded all job logs).
+        # 12288MB root headroom, 8192MB swap, ~115G build volume.
+        root-reserve-mb: 16384
+        temp-reserve-mb: 12288
         swap-size-mb: 8192
         remove-dotnet: 'true'
         remove-android: 'true'
@@ -115,8 +128,8 @@ jobs:
         ROOT_AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
         WS_AVAIL_MB=$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')
         echo "root_avail_mb=${ROOT_AVAIL_MB} workspace_avail_mb=${WS_AVAIL_MB}"
-        if [ "${ROOT_AVAIL_MB}" -lt 2048 ]; then
-          echo "::error::only ${ROOT_AVAIL_MB}MB free on / - the runner would die silently mid-build"
+        if [ "${ROOT_AVAIL_MB}" -lt 4096 ]; then
+          echo "::error::only ${ROOT_AVAIL_MB}MB free on / - temp-reserve-mb did not take effect, the runner would die silently mid-build"
           exit 1
         fi
         if [ "${WS_AVAIL_MB}" -lt 60000 ]; then
