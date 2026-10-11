@@ -102,6 +102,9 @@ jobs:
     - name: Sync source
       run: |
         repo init -u ${{ github.event.inputs.TWRP_MANIFEST_URL }} -b ${{ github.event.inputs.TWRP_MANIFEST_BRANCH }} --depth=1
+        find .repo/manifests -name "*.xml" -exec sed -i 's|ssh://git@github.com/|https://github.com/|g' {} +
+        find .repo/manifests -name "*.xml" -exec sed -i 's|git@github.com:|https://github.com/|g' {} +
+        grep -n "remote name=\"AERA\"" .repo/manifests/twrp-default.xml || true
         (while true; do echo "Syncing source..."; sleep 60; done) &
         TIP_PID=$!
         repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags || repo sync -c -j4
