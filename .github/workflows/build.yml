@@ -86,7 +86,12 @@ jobs:
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
       with:
-        root-reserve-mb: 4096
+        # The build volume is carved out of a loop file that lives on the ROOT
+        # filesystem, so every MB not reserved here is taken away from "/".
+        # When "/" fills up GitHub kills the runner and the job ends with ZERO
+        # logs (runs #5 and #7 died exactly like that at ~48 min).
+        root-reserve-mb: 8192
+        temp-reserve-mb: 10240
         swap-size-mb: 8192
         remove-dotnet: 'true'
         remove-android: 'true'
@@ -96,13 +101,28 @@ jobs:
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         key: aera-16-${{ github.event.inputs.DEVICE_NAME }}
-        max-size: 8G
+        max-size: 4G
         create-symlink: true
 
-    - name: Verify swap
+    - name: Verify swap and disk layout
       run: |
         free -h
         swapon --show || true
+        df -h /
+        df -h "$GITHUB_WORKSPACE"
+        mkdir -p "$GITHUB_WORKSPACE/.ccache"
+        df -h "$GITHUB_WORKSPACE/.ccache"
+        ROOT_AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
+        WS_AVAIL_MB=$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')
+        echo "root_avail_mb=${ROOT_AVAIL_MB} workspace_avail_mb=${WS_AVAIL_MB}"
+        if [ "${ROOT_AVAIL_MB}" -lt 2048 ]; then
+          echo "::error::only ${ROOT_AVAIL_MB}MB free on / - the runner would die silently mid-build"
+          exit 1
+        fi
+        if [ "${WS_AVAIL_MB}" -lt 60000 ]; then
+          echo "::error::only ${WS_AVAIL_MB}MB on the build volume - too small for an AOSP tree"
+          exit 1
+        fi
 
     - name: Setup environment
       run: |
@@ -147,23 +167,83 @@ jobs:
       working-directory: device/${{ github.event.inputs.DEVICE_PATH }}
 
     - name: Build AERA Recovery
+      id: build
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        export CCACHE_DIR="${HOME}/.cache/ccache"
-        export CCACHE_EXEC=$(command -v ccache)        
+        # ccache MUST live on the build volume. $HOME (/home/runner) is on the
+        # runner's root filesystem, which has almost no space left after
+        # maximize-build-space: writing up to 8GB there is what killed run #7.
+        export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+        export CCACHE_EXEC=$(command -v ccache)
         export USE_CCACHE=1
-        ccache -M 8G
-        ccache -s
+        mkdir -p "$CCACHE_DIR"
+        ccache -M 4G
+        ccache -p | grep -E "^\(.*\) (cache_dir|max_size)"
         echo "Executing lunch twrp_${{ env.LUNCH_TARGET }}..."
         lunch twrp_${{ env.LUNCH_TARGET }}
-        (while true; do echo `date +%T` "Building AERA Recovery..."; df -h /; free -h; sleep 60; done) &
+        TIP_LOG="$RUNNER_TEMP/build-watchdog.log"
+        DISK_ABORT="$RUNNER_TEMP/disk-abort"
+        rm -f "$DISK_ABORT"
+        (
+          set +e
+          while true; do
+            printf '%s root=%sMB workspace=%sMB mem=%sMB\n' \
+              "$(date -u +%T)" \
+              "$(df --output=avail -m / | tail -1 | tr -d ' ')" \
+              "$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')" \
+              "$(free -m | awk '/^Mem:/ {print $7}')"
+            ROOT_AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
+            WS_AVAIL=$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')
+            ROOT_AVAIL=${ROOT_AVAIL:-999999}
+            WS_AVAIL=${WS_AVAIL:-999999}
+            if [ "$ROOT_AVAIL" -lt 1024 ] || [ "$WS_AVAIL" -lt 2048 ]; then
+              echo "!!! disk exhaustion: root=${ROOT_AVAIL}MB workspace=${WS_AVAIL}MB at $(date -u)"
+              echo "disk-abort" > "$DISK_ABORT"
+              pkill -f soong_ui || true
+              pkill -f ninja || true
+            fi
+            sleep 30
+          done
+        ) > "$TIP_LOG" 2>&1 &
         TIP_PID=$!
+        set +e
         m ${{ github.event.inputs.BUILD_PARTITION }}image
+        BUILD_RC=$?
+        set -e
+        kill $TIP_PID 2>/dev/null || true
+        wait $TIP_PID 2>/dev/null || true
+        echo "=== build watchdog tail ==="
+        tail -n 30 "$TIP_LOG" || true
+        if [ -f "$DISK_ABORT" ]; then
+          echo "::error::build aborted early: disk exhaustion (see watchdog log above)"
+          exit 1
+        fi
+        if [ $BUILD_RC -ne 0 ]; then
+          echo "::error::m ${{ github.event.inputs.BUILD_PARTITION }}image failed with exit code $BUILD_RC"
+          exit $BUILD_RC
+        fi
         ccache -s
         mkdir -p out/artifacts
         find out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ -maxdepth 1 \( -name "*.img" -o -name "*.zip" \) -exec cp {} out/artifacts/ \;
-        kill $TIP_PID 2>/dev/null || true
+        ls -l out/artifacts/
+
+    - name: Diagnostics on failure
+      if: failure()
+      run: |
+        echo "=== df -h ==="; df -h || true
+        echo "=== df -i ==="; df -i || true
+        echo "=== free -h ==="; free -h || true
+        echo "=== swapon ==="; swapon --show || true
+        echo "=== watchdog log tail ==="; tail -n 60 "$RUNNER_TEMP/build-watchdog.log" 2>/dev/null || true
+        echo "=== space consumers ==="
+        du -xh --max-depth=1 "$GITHUB_WORKSPACE" 2>/dev/null | sort -h | tail -20 || true
+        du -sh "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/out" "$HOME/.cache" 2>/dev/null || true
+        echo "=== kernel log tail ==="
+        sudo dmesg -T 2>/dev/null | tail -60 || true
+        sudo journalctl -k --no-pager 2>/dev/null | tail -40 || true
+        echo "=== OOM evidence ==="
+        sudo grep -iE "out of memory|oom-kill|no space left" /var/log/syslog 2>/dev/null | tail -20 || true
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
