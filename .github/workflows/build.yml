@@ -85,25 +85,27 @@ jobs:
 
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 8192
+        swap-size-mb: 12288
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
 
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         create-symlink: true
 
-    - name: Setup zram
+    - name: Verify swap
       run: |
-        sudo apt install linux-modules-extra-$(uname -r) zram-tools -y
-        sudo modprobe zram
-        sudo sed -i 's/^#PERCENT=50/PERCENT=90/' /etc/default/zramswap
-        sudo sed -i 's/^#PRIORITY=100/PRIORITY=1000/' /etc/default/zramswap
-        sudo systemctl restart zramswap
-        zramctl
+        free -h
+        swapon --show || true
 
     - name: Setup environment
       run: |
         export DEBIAN_FRONTEND=noninteractive
-        sudo apt update && sudo apt upgrade -y
+        sudo apt update
         sudo apt install repo -y
         git config --global user.name ${{ github.actor }}
         git config --global user.email ${{ github.actor }}@users.noreply.github.com
