@@ -101,7 +101,7 @@ jobs:
 
     - name: Sync source
       run: |
-        repo init -u ${{ github.event.inputs.TWRP_MANIFEST_URL }} -b ${{ github.event.inputs.TWRP_MANIFEST_BRANCH }} -m twrp-default.xml --depth=1
+        repo init -u ${{ github.event.inputs.TWRP_MANIFEST_URL }} -b ${{ github.event.inputs.TWRP_MANIFEST_BRANCH }} --depth=1
         (while true; do echo "Syncing source..."; sleep 60; done) &
         TIP_PID=$!
         repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags || repo sync -c -j4
