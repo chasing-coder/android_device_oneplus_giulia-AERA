@@ -1,4 +1,4 @@
-# OnePlus Ace 5 / OnePlus 13R (giulia / giuliac) AERA Device Tree
+# OnePlus Ace 5 (PKG110) / OnePlus 13R AERA Device Tree
 
 Device tree for building AERA Recovery (LVGL interface) for OnePlus Ace 5 (PKG110) and OnePlus 13R (CPH2645 / CPH2647 / CPH2691).
 
@@ -11,7 +11,7 @@ Device tree for building AERA Recovery (LVGL interface) for OnePlus Ace 5 (PKG11
 | **GPU** | Adreno 750 |
 | **Display** | 6.78-inch 1.5K AMOLED, 2780 x 1264 pixels, 120Hz LTPO |
 | **OS** | ColorOS 15 (Android 15) |
-| **Device Codename** | `giuliac` (China Ace 5 / PKG110), `giulia` (Global 13R) |
+| **Device Codename** | **PKG110** (OnePlus Ace 5, AOSP `giuliac`), CPH2645 / CPH2647 / CPH2691 (OnePlus 13R, AOSP `giulia`) |
 
 ## Features & Bring-Up Targets
 
