@@ -38,7 +38,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Standard public runner: 4 vCPU / 16GB RAM / 145G root fs (no LVM, see the
+    # "Reclaim disk and add temporary swap" step). The sibling AERA device
+    # (cvhhji/android_device_oneplus_infiniti-AERA) builds Android 16 AERA
+    # recovery on this exact image in ~90 minutes with 12G of extra swap, so the
+    # wall we keep hitting is memory, not machine size.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
     permissions:
       contents: write
       issues: write
@@ -84,42 +90,39 @@ jobs:
     - name: Cleanup
       uses: rokibhasansagar/slimhub_actions@main
 
-    - name: Maximize build space
-      uses: easimon/maximize-build-space@master
-      with:
-        # Measured on this runner image (ubuntu-24.04, westus3): /mnt is NOT a
-        # separate disk, it lives on /dev/root, which is 145G with ~135G free
-        # after the cleanup step. maximize-build-space therefore does:
-        #   root_pv = free(/) - root-reserve-mb
-        #   avail(/mnt) is now exactly root-reserve-mb
-        #   temp_pv = root-reserve-mb - temp-reserve-mb   <-- so root-reserve-mb
-        #                                                      MUST exceed
-        #                                                      temp-reserve-mb,
-        #                                                      otherwise fallocate
-        #                                                      gets a negative size
-        #                                                      (run #8 died here)
-        #   build_lv = free(/) - temp-reserve-mb - swap-size-mb
-        #   free space left on / afterwards == temp-reserve-mb
-        # So temp-reserve-mb is the real root-fs headroom (the action's defaults
-        # left only 100MB, which is what killed runs #5 and #7 at ~48 min: the
-        # runner silently ran out of space and GitHub discarded all job logs).
-        # 8192MB root headroom, 12288MB swap, ~117G build volume. Swap went from
-        # 8G to 12G because soong_build's single-process analysis phase needs far
-        # more than this runner's 15.6GB of RAM: run #10 died there 90 seconds
-        # into the build, taking the whole runner (and its job log) with it.
-        root-reserve-mb: 16384
-        temp-reserve-mb: 8192
-        swap-size-mb: 12288
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-
-    - name: Setup ccache
-      uses: hendrikmuhs/ccache-action@v1.2
-      with:
-        key: aera-16-${{ github.event.inputs.DEVICE_NAME }}
-        max-size: 4G
-        create-symlink: true
+    # Reclaim disk and add temporary swap
+    #
+    # No easimon/maximize-build-space and no LVM any more.
+    #
+      # Measured on this runner image (ubuntu-24.04): /dev/root is 145G with
+      # ~135G free after the cleanup step, and /mnt is NOT a separate disk, so
+      # the LVM dance bought nothing but a fragile ~100MB root filesystem - which
+      # is what silently killed runs #5 and #7 at ~47 minutes (GitHub discards
+      # the whole job log when the runner is lost, so there is no evidence).
+      #
+      # Build straight on /dev/root instead, and spend a slice of it on swap:
+      # soong_build's single-process analysis phase wants far more than this
+      # runner's 15.6GB of RAM (run #10: 5.2GB -> 11.5GB RSS in 30s and still
+      # climbing; the runner was lost 30s later). The proven recipe of the
+      # sibling AERA device (cvhhji/android_device_oneplus_infiniti-AERA, three
+      # green Android 16 recovery builds) is exactly this: plain rm -rf for
+      # space, then a 12G extra swapfile on top of the image's ~3G /swapfile,
+      # then build in $HOME. We use 16G, giving ~19G of swap against 16G of RAM.
+    - name: Reclaim disk and add temporary swap
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+          /usr/local/share/boost /usr/share/swift || true
+        df -h /
+        sudo swapoff /swapfile-extra 2>/dev/null || true
+        sudo rm -f /swapfile-extra
+        sudo fallocate -l 16G /swapfile-extra || sudo dd if=/dev/zero of=/swapfile-extra bs=1M count=16384 status=none
+        sudo chmod 600 /swapfile-extra
+        sudo mkswap /swapfile-extra
+        sudo swapon /swapfile-extra
+        echo "=== memory / swap / disk after reclaim ==="
+        free -h
+        swapon --show
+        df -h /
 
     - name: Verify swap and disk layout
       run: |
@@ -127,23 +130,24 @@ jobs:
         swapon --show || true
         df -h /
         df -h "$GITHUB_WORKSPACE"
-        mkdir -p "$GITHUB_WORKSPACE/.ccache"
-        df -h "$GITHUB_WORKSPACE/.ccache"
         SWAP_TOT_MB=$(free -m | awk '/^Swap:/ {print $2}')
         echo "swap_total_mb=${SWAP_TOT_MB}"
         if [ "${SWAP_TOT_MB:-0}" -lt 8192 ]; then
-          echo "::error::only ${SWAP_TOT_MB}MB of swap - soong_build needs that headroom"
+          echo "::error::only ${SWAP_TOT_MB}MB of swap - soong_build's analysis phase needs that headroom (run #10 died there)"
           exit 1
         fi
         ROOT_AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
         WS_AVAIL_MB=$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')
         echo "root_avail_mb=${ROOT_AVAIL_MB} workspace_avail_mb=${WS_AVAIL_MB}"
-        if [ "${ROOT_AVAIL_MB}" -lt 4096 ]; then
-          echo "::error::only ${ROOT_AVAIL_MB}MB free on / - temp-reserve-mb did not take effect, the runner would die silently mid-build"
+        # Both are on /dev/root now (the LVM split is gone): the checked-out tree
+        # is ~55G and out/ adds ~50G, so under 60G the runner would die silently
+        # mid-build and take the job log with it.
+        if [ "${ROOT_AVAIL_MB}" -lt 60000 ]; then
+          echo "::error::only ${ROOT_AVAIL_MB}MB free on / - expected ~119000 after the 16G swapfile"
           exit 1
         fi
         if [ "${WS_AVAIL_MB}" -lt 60000 ]; then
-          echo "::error::only ${WS_AVAIL_MB}MB on the build volume - too small for an AOSP tree"
+          echo "::error::only ${WS_AVAIL_MB}MB on the workspace - too small for an AOSP tree"
           exit 1
         fi
 
@@ -151,7 +155,16 @@ jobs:
       run: |
         export DEBIAN_FRONTEND=noninteractive
         sudo apt update
-        sudo apt install repo -y
+        # Same dependency set the proven sibling AERA workflow installs
+        # (cvhhji/android_device_oneplus_infiniti-AERA), plus repo. The runner
+        # image already ships most of it; this is insurance against a missing
+        # host tool turning into an unexplained failure 40 minutes in.
+        sudo apt install -y --no-install-recommends \
+          repo bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+          git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
+          lib32z1-dev libelf-dev libgl1-mesa-dev libncurses-dev libssl-dev libxml2 \
+          libxml2-utils lz4 lzop openjdk-17-jdk pngcrush python3 python-is-python3 \
+          rsync schedtool squashfs-tools unzip xsltproc zip zlib1g-dev
         git config --global user.name ${{ github.actor }}
         git config --global user.email ${{ github.actor }}@users.noreply.github.com
         git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
@@ -218,26 +231,21 @@ jobs:
       id: build
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # soong_build is a Go program, and its analysis phase is exactly where
-        # this 16GB runner died (5.2GB -> 11.5GB RSS in 30s and still climbing).
-        # GOGC=50 halves Go's default heap-growth target, and GOMEMLIMIT makes
-        # the runtime collect harder near 12GiB instead of letting the kernel
-        # swap the machine to death. Both are inherited by soong_ui ->
-        # soong_build; the watchdog prints /proc/<pid>/environ to prove it.
+        # These two are almost certainly useless here, and that is exactly why
+        # they stay: upstream soong runs the build as
+        # `cd / && env -i "$BUILDER" ...` with a hand-built environment
+        # (android_build_soong ui/build/soong.go), so shell-level GOGC and
+        # GOMEMLIMIT are dropped before soong_build ever starts. The watchdog
+        # below dumps /proc/<pid>/environ to prove it either way. The only lever
+        # that has actually moved the needle so far is swap (reclaim step).
         GOGC: "50"
         GOMEMLIMIT: "12GiB"
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        # ccache MUST live on the build volume. $HOME (/home/runner) is on the
-        # runner's root filesystem, which has almost no space left after
-        # maximize-build-space: writing up to 8GB there is what killed run #7.
-        export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
-        export CCACHE_EXEC=$(command -v ccache)
-        export USE_CCACHE=1
-        mkdir -p "$CCACHE_DIR"
-        ccache -M 4G
-        ccache -p | grep -E "^\(.*\) (cache_dir|max_size)"
+        # No ccache: the proven sibling recipe builds this tree in ~90 minutes
+        # without it, and a cache_dir on a lost LVM volume was one more silent
+        # failure mode (run #7).
         echo "Executing lunch twrp_${{ env.LUNCH_TARGET }}..."
         lunch twrp_${{ env.LUNCH_TARGET }}
         BUILD_LOG="$GITHUB_WORKSPACE/build.log"
@@ -343,7 +351,7 @@ jobs:
         ) > "$RUNNER_TEMP/telemetry-stdout.log" 2>&1 &
         TIP_PID=$!
         set +e
-        m ${{ github.event.inputs.BUILD_PARTITION }}image 2>&1 | tee -a "$BUILD_LOG"
+        mka adbd ${{ github.event.inputs.BUILD_PARTITION }}image 2>&1 | tee -a "$BUILD_LOG"
         BUILD_RC=${PIPESTATUS[0]}
         set -e
         kill $TIP_PID 2>/dev/null || true
@@ -380,9 +388,30 @@ jobs:
           echo "::error::m ${{ github.event.inputs.BUILD_PARTITION }}image failed with exit code $BUILD_RC"
           exit $BUILD_RC
         fi
-        ccache -s
         mkdir -p out/artifacts
         find out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ -maxdepth 1 \( -name "*.img" -o -name "*.zip" \) -exec cp {} out/artifacts/ \;
+        ls -l out/artifacts/
+
+    - name: Produce AVB-transplanted variant
+      # The AOSP build signs recovery.img with the test key. The stock OnePlus
+      # image carries a 2240-byte OEM-signed vbmeta (SHA256_RSA4096) in the same
+      # "payload + vbmeta + zeros + AVBf footer" layout, so we can swap the
+      # vbmeta and give the bootloader the vendor signature chain back. Both
+      # variants ship: try -avb-oem.img first, fall back to the raw one (the
+      # Ace 5 already accepted an unsigned TWRP image, so this may not even
+      # matter), and D:\ace5\extracted\recovery.img is always the way home.
+      continue-on-error: true
+      run: |
+        set -x
+        DEV=device/${{ github.event.inputs.DEVICE_PATH }}
+        IMG=out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_PARTITION }}.img
+        VB="$DEV/avb/recovery-vbmeta.bin"
+        BASE=AERA-Recovery-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}
+        ls -l "$IMG" "$VB"
+        cp "$IMG" "out/artifacts/${BASE}-aosp-signed.img"
+        python3 "$DEV/tools/transplant_avb.py" "$VB" "$IMG" "out/artifacts/${BASE}-avb-oem.img"
+        (cd out/artifacts && sha256sum *.img > SHA256SUMS)
+        cat out/artifacts/SHA256SUMS
         ls -l out/artifacts/
 
     - name: Diagnostics on failure
@@ -400,7 +429,8 @@ jobs:
         tail -n 2000 "$GITHUB_WORKSPACE/build-watchdog.log" > "$GITHUB_WORKSPACE/watchdog-tail.log" 2>/dev/null || true
         echo "=== space consumers ==="
         du -xh --max-depth=1 "$GITHUB_WORKSPACE" 2>/dev/null | sort -h | tail -20 || true
-        du -sh "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/out" "$HOME/.cache" 2>/dev/null || true
+        du -sh "$GITHUB_WORKSPACE/out" 2>/dev/null || true
+        du -sh /swapfile-extra 2>/dev/null || true
         echo "=== kernel log tail ==="
         sudo dmesg -T 2>/dev/null | tail -60 || true
         sudo journalctl -k --no-pager 2>/dev/null | tail -40 || true
