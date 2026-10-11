@@ -95,6 +95,8 @@ jobs:
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
+        key: aera-16-${{ github.event.inputs.DEVICE_NAME }}
+        max-size: 8G
         create-symlink: true
 
     - name: Verify swap
@@ -148,15 +150,17 @@ jobs:
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        export CCACHE_DIR=.ccache
+        export CCACHE_DIR="${HOME}/.cache/ccache"
         export CCACHE_EXEC=$(command -v ccache)        
-        export CCACHE_MAXSIZE=5G
         export USE_CCACHE=1
+        ccache -M 8G
+        ccache -s
         echo "Executing lunch twrp_${{ env.LUNCH_TARGET }}..."
         lunch twrp_${{ env.LUNCH_TARGET }}
         (while true; do echo `date +%T` "Building AERA Recovery..."; df -h /; free -h; sleep 60; done) &
         TIP_PID=$!
         m ${{ github.event.inputs.BUILD_PARTITION }}image
+        ccache -s
         mkdir -p out/artifacts
         find out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ -maxdepth 1 \( -name "*.img" -o -name "*.zip" \) -exec cp {} out/artifacts/ \;
         kill $TIP_PID 2>/dev/null || true
