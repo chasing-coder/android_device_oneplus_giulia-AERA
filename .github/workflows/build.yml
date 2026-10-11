@@ -86,8 +86,8 @@ jobs:
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
       with:
-        root-reserve-mb: 8192
-        swap-size-mb: 12288
+        root-reserve-mb: 4096
+        swap-size-mb: 8192
         remove-dotnet: 'true'
         remove-android: 'true'
         remove-haskell: 'true'
@@ -122,6 +122,9 @@ jobs:
         TIP_PID=$!
         repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags || repo sync -c -j4
         kill $TIP_PID 2>/dev/null || true
+        echo "Removing .repo cache to free up ~20GB of disk space..."
+        rm -rf .repo
+        df -h
 
     - name: Setup device
       run: |
@@ -151,7 +154,7 @@ jobs:
         export USE_CCACHE=1
         echo "Executing lunch twrp_${{ env.LUNCH_TARGET }}..."
         lunch twrp_${{ env.LUNCH_TARGET }}
-        (while true; do echo `date +%T` "Building AERA Recovery..."; free -h; sleep 30; done) &
+        (while true; do echo `date +%T` "Building AERA Recovery..."; df -h /; free -h; sleep 60; done) &
         TIP_PID=$!
         m ${{ github.event.inputs.BUILD_PARTITION }}image
         mkdir -p out/artifacts
