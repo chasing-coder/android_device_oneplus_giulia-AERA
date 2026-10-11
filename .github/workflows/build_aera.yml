@@ -1,0 +1,148 @@
+name: Build AERA Recovery (Android 16)
+
+on:
+  workflow_dispatch:
+    inputs:
+      DEVICE_CODE:
+        description: '机型代号 (Device Codename，例如 giulia / dodge / marble)'
+        required: true
+        default: 'giulia'
+      DEVICE_TREE_URL:
+        description: 'Device Tree 仓库 Git URL'
+        required: true
+        default: 'https://github.com/cheng343/android_device_oneplus_giulia-AERA'
+      DEVICE_TREE_BRANCH:
+        description: 'Device Tree 分支'
+        required: true
+        default: 'aera-16.0'
+      DEVICE_PATH:
+        description: 'Device Tree 本地放置路径 (如 device/oneplus/giulia)'
+        required: true
+        default: 'device/oneplus/giulia'
+      BUILD_TARGET:
+        description: '编译目标文件 (recoveryimage 或 bootimage)'
+        required: true
+        default: 'recoveryimage'
+
+jobs:
+  build:
+    name: Build AERA Recovery
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: 1. 检出工作流仓库
+        uses: actions/checkout@v4
+
+      - name: 2. 磁盘空间极限重构与清理
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 16384
+          temp-reserve-mb: 12288
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: 3. 校验磁盘与内存状态
+        run: |
+          echo "=== 磁盘挂载布局 ==="
+          df -h
+          echo "=== 内存与交换空间 ==="
+          free -h
+
+      - name: 4. 安装 Android 16 编译依赖与 Repo 工具
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y \
+            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev libx11-dev \
+            lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            python3 python-is-python3 rsync lz4 bc ccache
+          
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          sudo ln -sf ~/bin/repo /usr/bin/repo
+
+          # 配置 Git 自动将 upstream 中硬编码的 SSH URL 映射为 HTTPS
+          git config --global user.name "AERA-Builder"
+          git config --global user.email "builder@github.local"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: 5. 初始化清单并浅拉取 AERA 16.0 源码
+        run: |
+          # 必须在 $GITHUB_WORKSPACE (挂载在 ~115GB 大容量分区) 中构建，不能在 ~ (根目录只有 12GB)
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workspace"
+          mkdir -p "${WORKDIR}"
+          cd "${WORKDIR}"
+
+          echo "=== 初始化 Manifest ==="
+          repo init --depth=1 -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
+          
+          # 双重保险：强制替换 manifest 中遗留的 ssh:// 前缀
+          find .repo/manifests -name "*.xml" -exec sed -i 's|ssh://git@github.com/|https://github.com/|g' {} + || true
+
+          echo "=== 极简浅拉取核心源码 ==="
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j$(nproc --all) || repo sync -c -j4
+
+          echo "=== 克隆机型专属 Device Tree ==="
+          git clone --depth=1 ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ${{ github.event.inputs.DEVICE_PATH }}
+
+      - name: 6. 空间破局核心操作：丢卒保车彻底删除 .repo
+        run: |
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workspace"
+          cd "${WORKDIR}"
+          echo "=== 抹除 .repo 前磁盘剩余 ==="
+          df -h "${WORKDIR}"
+          
+          echo "Removing .repo to free up ~20GB of disk space..."
+          rm -rf .repo
+          
+          echo "=== 抹除 .repo 后可用磁盘 ==="
+          df -h "${WORKDIR}"
+
+      - name: 7. 配置环境并执行 Android 16 构建
+        env:
+          # Soong Go 内存上限调优，避免 Android 16 符号分析阶段 OOM
+          GOGC: "50"
+          GOMEMLIMIT: "12GiB"
+          ALLOW_MISSING_DEPENDENCIES: "true"
+        run: |
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workspace"
+          cd "${WORKDIR}"
+          source build/envsetup.sh
+          
+          echo "=== 探测并加载 Lunch Target ==="
+          TARGET="${{ github.event.inputs.DEVICE_CODE }}"
+          # Android 16 强制要求 <product>-<release>-<variant> 三段式，优先适配 bp2a
+          lunch twrp_${TARGET}-bp2a-eng || lunch aera_${TARGET}-bp2a-eng || lunch twrp_${TARGET}-eng || lunch omni_${TARGET}-eng
+
+          echo "=== 开始编译 ${{ github.event.inputs.BUILD_TARGET }} ==="
+          # Android 16 统一调用 m 执行构建
+          if command -v mka >/dev/null 2>&1; then
+            mka ${{ github.event.inputs.BUILD_TARGET }} -j$(nproc --all)
+          else
+            m ${{ github.event.inputs.BUILD_TARGET }}
+          fi
+
+          echo "=== 归集编译产物 ==="
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+          find "out/target/product/${TARGET}" -maxdepth 1 \( -name "*.img" -o -name "*.zip" \) -exec cp {} "${GITHUB_WORKSPACE}/artifacts/" \;
+          ls -lh "${GITHUB_WORKSPACE}/artifacts/"
+
+      - name: 8. 直传产物至 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: AERA-${{ github.event.inputs.DEVICE_CODE }}-${{ github.run_id }}
+          name: AERA Recovery for ${{ github.event.inputs.DEVICE_CODE }} (Android 16)
+          files: |
+            ${{ github.workspace }}/artifacts/*.img
+            ${{ github.workspace }}/artifacts/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
