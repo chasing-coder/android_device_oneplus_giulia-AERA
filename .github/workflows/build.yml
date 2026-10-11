@@ -11,10 +11,6 @@ on:
         description: "AERA branch"
         required: true
         default: "aera-16.0"
-      TWRP_BOOTABLE_RECOVERY:
-        description: "bootable_recovery"
-        required: true
-        default: "https://github.com/AERA-Recovery/android_bootable_recovery"
       DEVICE_TREE_URL:
         description: "Device tree url"
         required: true
@@ -100,21 +96,16 @@ jobs:
         sudo apt install repo -y
         git config --global user.name ${{ github.actor }}
         git config --global user.email ${{ github.actor }}@users.noreply.github.com
+        git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+        git config --global url."https://github.com/".insteadOf "git@github.com:"
 
     - name: Sync source
       run: |
-        repo init -u ${{ github.event.inputs.TWRP_MANIFEST_URL }} -b ${{ github.event.inputs.TWRP_MANIFEST_BRANCH }} --depth=1
+        repo init -u ${{ github.event.inputs.TWRP_MANIFEST_URL }} -b ${{ github.event.inputs.TWRP_MANIFEST_BRANCH }} -m twrp-default.xml --depth=1
         (while true; do echo "Syncing source..."; sleep 60; done) &
         TIP_PID=$!
-        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
-        kill $TIP_PID && exit 0
-
-    - name: Setup bootable_recovery and vendor_recovery
-      run: |
-        rm -rf bootable/recovery
-        git clone ${{ github.event.inputs.TWRP_BOOTABLE_RECOVERY }} -b aera-16.0 bootable/recovery
-        rm -rf vendor/recovery
-        git clone https://github.com/AERA-Recovery/android_vendor_recovery -b aera-16.0 vendor/recovery
+        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags || repo sync -c -j4
+        kill $TIP_PID 2>/dev/null || true
 
     - name: Setup device
       run: |
@@ -143,12 +134,12 @@ jobs:
         export CCACHE_MAXSIZE=5G
         export USE_CCACHE=1
         lunch twrp_${{ env.LUNCH_TARGET }}
-        (while true; do echo `date +%T` "Building AERA Recovery..."; free -h; sleep 10; done) &
+        (while true; do echo `date +%T` "Building AERA Recovery..."; free -h; sleep 30; done) &
         TIP_PID=$!
-        mka ${{ github.event.inputs.BUILD_PARTITION }}image
+        m ${{ github.event.inputs.BUILD_PARTITION }}image
         mkdir -p out/artifacts
         cp out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_PARTITION }}.img out/artifacts/AERA-Recovery-16.0-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}.img
-        kill $TIP_PID && exit 0        
+        kill $TIP_PID 2>/dev/null || true
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

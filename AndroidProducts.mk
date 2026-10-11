@@ -10,4 +10,5 @@ PRODUCT_MAKEFILES := \
 COMMON_LUNCH_CHOICES := \
     twrp_giulia-user \
     twrp_giulia-userdebug \
-    twrp_giulia-eng
+    twrp_giulia-eng \
+    twrp_giulia-bp2a-eng
