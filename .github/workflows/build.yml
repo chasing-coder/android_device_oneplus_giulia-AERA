@@ -41,6 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
     steps:
     - name: Show build info
       run: |
@@ -179,8 +180,35 @@ jobs:
         cat INFO.txt
       working-directory: device/${{ github.event.inputs.DEVICE_PATH }}
 
+    - name: Open telemetry issue
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        BODY=$(cat <<EOF
+        Live build telemetry for [run ${{ github.run_id }}](https://github.com/$GITHUB_REPOSITORY/actions/runs/${{ github.run_id }}).
+
+        Why this exists: runs #5, #7 and #9 all reached ~47 minutes into the build step
+        and then the runner disappeared, and GitHub **discards the whole job log** when a
+        runner is lost, so those failures left no evidence at all. This thread is the only
+        channel that survives, so the build log and the resource state are pushed here
+        every 30 seconds.
+
+        Safe to delete once the run is done.
+        EOF
+        )
+        NUM=$(curl -sS -X POST \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$GITHUB_REPOSITORY/issues" \
+          --data-binary "$(jq -n --arg t "[telemetry] run ${{ github.run_id }} build log" --arg b "$BODY" '{title:$t, body:$b}')" | jq -r '.number')
+        echo "TELEMETRY_ISSUE=$NUM" >> "$GITHUB_ENV"
+        echo "telemetry issue: #$NUM"
+
     - name: Build AERA Recovery
       id: build
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
@@ -195,37 +223,83 @@ jobs:
         ccache -p | grep -E "^\(.*\) (cache_dir|max_size)"
         echo "Executing lunch twrp_${{ env.LUNCH_TARGET }}..."
         lunch twrp_${{ env.LUNCH_TARGET }}
-        TIP_LOG="$RUNNER_TEMP/build-watchdog.log"
-        DISK_ABORT="$RUNNER_TEMP/disk-abort"
+        BUILD_LOG="$GITHUB_WORKSPACE/build.log"
+        : > "$BUILD_LOG"
+        TIP_LOG="$GITHUB_WORKSPACE/build-watchdog.log"
+        DISK_ABORT="$GITHUB_WORKSPACE/disk-abort"
         rm -f "$DISK_ABORT"
+        ISSUE="${TELEMETRY_ISSUE:-}"
+        echo "telemetry issue: ${ISSUE:-none}"
+
+        # ---- survive-the-runner-death telemetry ---------------------------
+        # Runs #5/#7/#9 each died ~47 min into this step, and GitHub throws the
+        # entire job log away when a runner is lost, so nothing was left to
+        # debug. An issue comment is outside the runner, so it survives.
         (
           set +e
+          OFF=0
           while true; do
-            printf '%s root=%sMB workspace=%sMB mem=%sMB\n' \
-              "$(date -u +%T)" \
-              "$(df --output=avail -m / | tail -1 | tr -d ' ')" \
-              "$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')" \
-              "$(free -m | awk '/^Mem:/ {print $7}')"
-            ROOT_AVAIL=$(df --output=avail -m / | tail -1 | tr -d ' ')
-            WS_AVAIL=$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')
-            ROOT_AVAIL=${ROOT_AVAIL:-999999}
-            WS_AVAIL=${WS_AVAIL:-999999}
+            SIZE=$(stat -c %s "$BUILD_LOG" 2>/dev/null || echo 0)
+            ROOT_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
+            WS_MB=$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')
+            MEM_TOT=$(free -m | awk '/^Mem:/ {print $2}')
+            MEM_AVAIL=$(free -m | awk '/^Mem:/ {print $7}')
+            SWAP_USED=$(free -m | awk '/^Swap:/ {print $3}')
+            TOP=$(ps -eo rss=,comm= --sort=-rss | head -3 | tr '\n' ';')
+            STAMP="$(date -u +%T) root=${ROOT_MB}MB ws=${WS_MB}MB mem_avail=${MEM_AVAIL}MB/${MEM_TOT}MB swap_used=${SWAP_USED}MB log=${SIZE}B top=${TOP}"
+            echo "$STAMP" >> "$TIP_LOG"
+            echo "$STAMP"
+            ROOT_AVAIL=${ROOT_MB:-999999}
+            WS_AVAIL=${WS_MB:-999999}
             if [ "$ROOT_AVAIL" -lt 1024 ] || [ "$WS_AVAIL" -lt 2048 ]; then
               echo "!!! disk exhaustion: root=${ROOT_AVAIL}MB workspace=${WS_AVAIL}MB at $(date -u)"
               echo "disk-abort" > "$DISK_ABORT"
               pkill -f soong_ui || true
               pkill -f ninja || true
             fi
+            if [ -n "$ISSUE" ]; then
+              {
+                echo "### ${STAMP%% top=*}"
+                echo "top rss: ${TOP}"
+                sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -3 || true
+                if [ "$SIZE" -gt "$OFF" ]; then
+                  echo '```'
+                  tail -c +$((OFF + 1)) "$BUILD_LOG" | tail -c 50000
+                  echo '```'
+                  OFF=$SIZE
+                fi
+              } > "$RUNNER_TEMP/tel.md"
+              jq -Rs '{body: .}' "$RUNNER_TEMP/tel.md" > "$RUNNER_TEMP/tel.json"
+              curl -sS -o /dev/null -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments" \
+                --data-binary @"$RUNNER_TEMP/tel.json" || true
+            fi
             sleep 30
           done
-        ) > "$TIP_LOG" 2>&1 &
+        ) > "$RUNNER_TEMP/telemetry-stdout.log" 2>&1 &
         TIP_PID=$!
         set +e
-        m ${{ github.event.inputs.BUILD_PARTITION }}image
-        BUILD_RC=$?
+        m ${{ github.event.inputs.BUILD_PARTITION }}image 2>&1 | tee -a "$BUILD_LOG"
+        BUILD_RC=${PIPESTATUS[0]}
         set -e
         kill $TIP_PID 2>/dev/null || true
         wait $TIP_PID 2>/dev/null || true
+        if [ -n "$ISSUE" ]; then
+          {
+            echo "### FINAL rc=${BUILD_RC} log=$(stat -c %s "$BUILD_LOG" 2>/dev/null || echo 0)B at $(date -u +%T)"
+            echo '```'
+            tail -c 50000 "$BUILD_LOG"
+            echo '```'
+          } > "$RUNNER_TEMP/tel.md"
+          jq -Rs '{body: .}' "$RUNNER_TEMP/tel.md" > "$RUNNER_TEMP/tel.json"
+          curl -sS -o /dev/null -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments" \
+            --data-binary @"$RUNNER_TEMP/tel.json" || true
+        fi
         echo "=== build watchdog tail ==="
         tail -n 30 "$TIP_LOG" || true
         if [ -f "$DISK_ABORT" ]; then
@@ -248,7 +322,10 @@ jobs:
         echo "=== df -i ==="; df -i || true
         echo "=== free -h ==="; free -h || true
         echo "=== swapon ==="; swapon --show || true
-        echo "=== watchdog log tail ==="; tail -n 60 "$RUNNER_TEMP/build-watchdog.log" 2>/dev/null || true
+        echo "=== watchdog log tail ==="; tail -n 60 "$GITHUB_WORKSPACE/build-watchdog.log" 2>/dev/null || tail -n 60 "$RUNNER_TEMP/build-watchdog.log" 2>/dev/null || true
+        echo "=== build log tail (last 60) ==="; tail -n 60 "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
+        tail -n 20000 "$GITHUB_WORKSPACE/build.log" > "$GITHUB_WORKSPACE/build-tail.log" 2>/dev/null || true
+        tail -n 2000 "$GITHUB_WORKSPACE/build-watchdog.log" > "$GITHUB_WORKSPACE/watchdog-tail.log" 2>/dev/null || true
         echo "=== space consumers ==="
         du -xh --max-depth=1 "$GITHUB_WORKSPACE" 2>/dev/null | sort -h | tail -20 || true
         du -sh "$GITHUB_WORKSPACE/.ccache" "$GITHUB_WORKSPACE/out" "$HOME/.cache" 2>/dev/null || true
@@ -257,6 +334,17 @@ jobs:
         sudo journalctl -k --no-pager 2>/dev/null | tail -40 || true
         echo "=== OOM evidence ==="
         sudo grep -iE "out of memory|oom-kill|no space left" /var/log/syslog 2>/dev/null | tail -20 || true
+
+    - name: Upload failure logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: aera-build-logs-${{ github.run_id }}
+        path: |
+          build-tail.log
+          watchdog-tail.log
+        if-no-files-found: ignore
+        retention-days: 7
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
