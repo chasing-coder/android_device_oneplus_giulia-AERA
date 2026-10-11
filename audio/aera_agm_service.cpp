@@ -38,9 +38,9 @@ void Log(int priority, const char* message) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2 || std::strcmp(argv[1], "--waffle-stock-audio") != 0) {
+  if (argc != 2 || (std::strcmp(argv[1], "--waffle-stock-audio") != 0 && std::strcmp(argv[1], "--giulia-stock-audio") != 0)) {
     Log(ANDROID_LOG_ERROR,
-        "Refusing to start without the Waffle stock-audio mode.");
+        "Refusing to start without stock-audio mode.");
     return 64;
   }
   if (getuid() != 0 || access(kPrimaryHal, R_OK) != 0) {

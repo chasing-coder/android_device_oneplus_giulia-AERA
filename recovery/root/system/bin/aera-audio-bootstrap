@@ -38,11 +38,11 @@ fail() {
 
 set_stage validate-device
 case "$(getprop ro.product.device)" in
-    waffle|PJD110|CPH2573|CPH2581|CPH2583|OP595DL1|OP5929L1) ;;
+    waffle|PJD110|CPH2573|CPH2581|CPH2583|OP595DL1|OP5929L1|giulia|giuliac|PKG110|CPH2645|CPH2647|CPH2691|OP5D2BL1|OP5D3BL1) ;;
     *)
         case "$(getprop ro.product.vendor.device)" in
-            waffle|PJD110|CPH2573|CPH2581|CPH2583|OP595DL1|OP5929L1) ;;
-            *) fail "this backend is only valid on Waffle/OnePlus 12" ;;
+            waffle|PJD110|CPH2573|CPH2581|CPH2583|OP595DL1|OP5929L1|giulia|giuliac|PKG110|CPH2645|CPH2647|CPH2691|OP5D2BL1|OP5D3BL1) ;;
+            *) fail "this backend is only valid on supported SM8650 devices" ;;
         esac
         ;;
 esac
