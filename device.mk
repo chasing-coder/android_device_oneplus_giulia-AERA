@@ -1,10 +1,10 @@
 #
-# Copyright (C) 2025 The Android Open Source Project
+# Copyright (C) 2025-2026 The Android Open Source Project
 #
 # SPDX-License-Identifier: Apache-2.0
 #
 
-LOCAL_PATH := device/oneplus/waffle
+LOCAL_PATH := device/oneplus/giulia
 
 # Shipping API level
 BOARD_SHIPPING_API_LEVEL    := 35
@@ -37,11 +37,9 @@ PRODUCT_PACKAGES += \
     aera-browser-jail \
     aera-gpu-probe
 
-# Waffle's matching Adreno 750 userspace and allocator are bundled in this
-# device tree. Other devices retain AERA's software-renderer fallback.
+# Adreno 750 userspace and allocator are bundled in this device tree.
 PRODUCT_VENDOR_PROPERTIES += \
     ro.hardware.egl=adreno
 
 # AERA recovery settings
-$(call inherit-product, $(LOCAL_PATH)/aera_waffle.mk)
-#
+$(call inherit-product, $(LOCAL_PATH)/aera_giulia.mk)

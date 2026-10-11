@@ -26,15 +26,15 @@ on:
       DEVICE_PATH:
         description: "Device path device/"
         required: true
-        default: "oplus/sm86xx"
+        default: "oneplus/giulia"
       DEVICE_NAME:
         description: "Device name"
         required: true
-        default: "sm86xx"
+        default: "giulia"
       LUNCH_TARGET:
         description: "lunch twrp_ (default same as device name)"
         required: false
-        default: ""
+        default: "giulia"
       BUILD_PARTITION:
         description: "Build partition"
         required: true

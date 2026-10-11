@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-DEVICE_PATH := device/oneplus/waffle
+DEVICE_PATH := device/oneplus/giulia
 
 # Building with minimal manifest
 ALLOW_MISSING_DEPENDENCIES                      := true
@@ -74,6 +74,10 @@ RECOVERY_BINARY_SOURCE_FILES    += $(TARGET_OUT_EXECUTABLES)/strace
 # File systems
 TARGET_USERIMAGES_USE_F2FS := true
 AERA_USE_DMCTL             := true
+
+# Init
+TARGET_INIT_VENDOR_LIB          := //$(DEVICE_PATH):libinit_oplus_sm86xx
+TARGET_RECOVERY_DEVICE_MODULES  += libinit_oplus_sm86xx
 
 # Kernel
 BOARD_KERNEL_IMAGE_NAME     := Image
@@ -149,7 +153,7 @@ PLATFORM_VERSION                := 99.87.36
 PLATFORM_VERSION_LAST_STABLE    := $(PLATFORM_VERSION)
 PLATFORM_SECURITY_PATCH         := 2099-12-31
 VENDOR_SECURITY_PATCH           := $(PLATFORM_SECURITY_PATCH)
-AERA_DEVICE_VERSION             := OnePlus_12
+AERA_DEVICE_VERSION             := OnePlus_Ace_5
 
 # Verified Boot
 BOARD_AVB_ENABLE := true
