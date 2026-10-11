@@ -103,10 +103,13 @@ jobs:
         # So temp-reserve-mb is the real root-fs headroom (the action's defaults
         # left only 100MB, which is what killed runs #5 and #7 at ~48 min: the
         # runner silently ran out of space and GitHub discarded all job logs).
-        # 12288MB root headroom, 8192MB swap, ~115G build volume.
+        # 8192MB root headroom, 12288MB swap, ~117G build volume. Swap went from
+        # 8G to 12G because soong_build's single-process analysis phase needs far
+        # more than this runner's 15.6GB of RAM: run #10 died there 90 seconds
+        # into the build, taking the whole runner (and its job log) with it.
         root-reserve-mb: 16384
-        temp-reserve-mb: 12288
-        swap-size-mb: 8192
+        temp-reserve-mb: 8192
+        swap-size-mb: 12288
         remove-dotnet: 'true'
         remove-android: 'true'
         remove-haskell: 'true'
@@ -126,6 +129,12 @@ jobs:
         df -h "$GITHUB_WORKSPACE"
         mkdir -p "$GITHUB_WORKSPACE/.ccache"
         df -h "$GITHUB_WORKSPACE/.ccache"
+        SWAP_TOT_MB=$(free -m | awk '/^Swap:/ {print $2}')
+        echo "swap_total_mb=${SWAP_TOT_MB}"
+        if [ "${SWAP_TOT_MB:-0}" -lt 8192 ]; then
+          echo "::error::only ${SWAP_TOT_MB}MB of swap - soong_build needs that headroom"
+          exit 1
+        fi
         ROOT_AVAIL_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
         WS_AVAIL_MB=$(df --output=avail -m "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')
         echo "root_avail_mb=${ROOT_AVAIL_MB} workspace_avail_mb=${WS_AVAIL_MB}"
@@ -209,6 +218,14 @@ jobs:
       id: build
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # soong_build is a Go program, and its analysis phase is exactly where
+        # this 16GB runner died (5.2GB -> 11.5GB RSS in 30s and still climbing).
+        # GOGC=50 halves Go's default heap-growth target, and GOMEMLIMIT makes
+        # the runtime collect harder near 12GiB instead of letting the kernel
+        # swap the machine to death. Both are inherited by soong_ui ->
+        # soong_build; the watchdog prints /proc/<pid>/environ to prove it.
+        GOGC: "50"
+        GOMEMLIMIT: "12GiB"
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
@@ -228,16 +245,26 @@ jobs:
         TIP_LOG="$GITHUB_WORKSPACE/build-watchdog.log"
         DISK_ABORT="$GITHUB_WORKSPACE/disk-abort"
         rm -f "$DISK_ABORT"
+        PEAK_FILE="$GITHUB_WORKSPACE/peak-mem.txt"
+        : > "$PEAK_FILE"
+        MEM_ABORT="$GITHUB_WORKSPACE/mem-abort"
+        rm -f "$MEM_ABORT"
         ISSUE="${TELEMETRY_ISSUE:-}"
         echo "telemetry issue: ${ISSUE:-none}"
+        echo "go tuning: GOGC=${GOGC:-unset} GOMEMLIMIT=${GOMEMLIMIT:-unset}"
 
         # ---- survive-the-runner-death telemetry ---------------------------
-        # Runs #5/#7/#9 each died ~47 min into this step, and GitHub throws the
-        # entire job log away when a runner is lost, so nothing was left to
-        # debug. An issue comment is outside the runner, so it survives.
+        # Run #10 proved the runner dies inside soong_build's analysis phase, and
+        # GitHub throws the entire job log away when a runner is lost, so an
+        # issue comment is the only channel that survives.
         (
           set +e
           OFF=0
+          PEAK_RSS=0
+          PEAK_NAME="?"
+          LOW_MEM_TICKS=0
+          SOONG_STATE=down
+          START_EPOCH=$(date +%s)
           while true; do
             SIZE=$(stat -c %s "$BUILD_LOG" 2>/dev/null || echo 0)
             ROOT_MB=$(df --output=avail -m / | tail -1 | tr -d ' ')
@@ -245,8 +272,31 @@ jobs:
             MEM_TOT=$(free -m | awk '/^Mem:/ {print $2}')
             MEM_AVAIL=$(free -m | awk '/^Mem:/ {print $7}')
             SWAP_USED=$(free -m | awk '/^Swap:/ {print $3}')
+            SWAP_TOT=$(free -m | awk '/^Swap:/ {print $2}')
+            SWAP_FREE=$(( ${SWAP_TOT:-0} - ${SWAP_USED:-0} ))
+            TOPLINE=$(ps -eo pid=,rss=,comm= --sort=-rss | head -1)
+            TOP_PID=$(echo "$TOPLINE" | awk '{print $1}')
+            TOP_RSS_KB=$(echo "$TOPLINE" | awk '{print $2}')
+            TOP_NAME=$(echo "$TOPLINE" | awk '{print $3}')
             TOP=$(ps -eo rss=,comm= --sort=-rss | head -3 | tr '\n' ';')
-            STAMP="$(date -u +%T) root=${ROOT_MB}MB ws=${WS_MB}MB mem_avail=${MEM_AVAIL}MB/${MEM_TOT}MB swap_used=${SWAP_USED}MB log=${SIZE}B top=${TOP}"
+            if [ "${TOP_RSS_KB:-0}" -gt "$PEAK_RSS" ]; then
+              PEAK_RSS=${TOP_RSS_KB:-0}
+              PEAK_NAME=$TOP_NAME
+              echo "$(date -u +%T) peak=${PEAK_RSS}KB comm=${PEAK_NAME}" >> "$PEAK_FILE"
+            fi
+            ELAPSED=$(( $(date +%s) - START_EPOCH ))
+            GOENV=""
+            if [ "$TOP_NAME" = "soong_build" ] && [ -r "/proc/$TOP_PID/environ" ]; then
+              GOENV=$(tr '\0' '\n' < "/proc/$TOP_PID/environ" 2>/dev/null | grep -E '^(GOGC|GOMEMLIMIT)=' | tr '\n' ' ')
+              if [ "$SOONG_STATE" = "down" ]; then
+                echo "$(date -u +%T) soong_build analysis started (pid=$TOP_PID ${GOENV})" | tee -a "$TIP_LOG"
+                SOONG_STATE=up
+              fi
+            elif [ "$SOONG_STATE" = "up" ] && ! pgrep -x soong_build >/dev/null 2>&1; then
+              echo "$(date -u +%T) soong_build analysis no longer running, peak was ${PEAK_RSS}KB" | tee -a "$TIP_LOG"
+              SOONG_STATE=down
+            fi
+            STAMP="$(date -u +%T) t=${ELAPSED}s root=${ROOT_MB}MB ws=${WS_MB}MB mem_avail=${MEM_AVAIL}MB/${MEM_TOT}MB swap=${SWAP_USED}/${SWAP_TOT}MB peak=${PEAK_RSS}KB(${PEAK_NAME}) log=${SIZE}B top=${TOP}"
             echo "$STAMP" >> "$TIP_LOG"
             echo "$STAMP"
             ROOT_AVAIL=${ROOT_MB:-999999}
@@ -257,14 +307,26 @@ jobs:
               pkill -f soong_ui || true
               pkill -f ninja || true
             fi
+            if [ "${MEM_AVAIL:-99999}" -lt 200 ] && [ "$SWAP_FREE" -lt 512 ]; then
+              LOW_MEM_TICKS=$((LOW_MEM_TICKS + 1))
+            else
+              LOW_MEM_TICKS=0
+            fi
+            if [ "$LOW_MEM_TICKS" -ge 4 ]; then
+              echo "!!! memory exhaustion: mem_avail=${MEM_AVAIL}MB swap_free=${SWAP_FREE}MB peak=${PEAK_RSS}KB(${PEAK_NAME}) at $(date -u)"
+              echo "mem-abort" > "$MEM_ABORT"
+              pkill -f soong_build || true
+              pkill -f soong_ui || true
+            fi
             if [ -n "$ISSUE" ]; then
               {
                 echo "### ${STAMP%% top=*}"
+                [ -n "$GOENV" ] && echo "soong env: ${GOENV}"
                 echo "top rss: ${TOP}"
                 sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -3 || true
                 if [ "$SIZE" -gt "$OFF" ]; then
                   echo '```'
-                  tail -c +$((OFF + 1)) "$BUILD_LOG" | tail -c 50000
+                  tail -c +$((OFF + 1)) "$BUILD_LOG" | tail -c 20000
                   echo '```'
                   OFF=$SIZE
                 fi
@@ -289,8 +351,10 @@ jobs:
         if [ -n "$ISSUE" ]; then
           {
             echo "### FINAL rc=${BUILD_RC} log=$(stat -c %s "$BUILD_LOG" 2>/dev/null || echo 0)B at $(date -u +%T)"
+            echo "peak memory observed: $(tail -1 "$PEAK_FILE" 2>/dev/null)"
+            echo "disk/mem watchdog last line: $(tail -1 "$TIP_LOG" 2>/dev/null)"
             echo '```'
-            tail -c 50000 "$BUILD_LOG"
+            tail -c 20000 "$BUILD_LOG"
             echo '```'
           } > "$RUNNER_TEMP/tel.md"
           jq -Rs '{body: .}' "$RUNNER_TEMP/tel.md" > "$RUNNER_TEMP/tel.json"
@@ -302,6 +366,12 @@ jobs:
         fi
         echo "=== build watchdog tail ==="
         tail -n 30 "$TIP_LOG" || true
+        echo "=== peak memory ==="
+        tail -n 5 "$PEAK_FILE" || true
+        if [ -f "$MEM_ABORT" ]; then
+          echo "::error::build aborted early: memory exhaustion (peak $(tail -1 "$PEAK_FILE"))"
+          exit 1
+        fi
         if [ -f "$DISK_ABORT" ]; then
           echo "::error::build aborted early: disk exhaustion (see watchdog log above)"
           exit 1
@@ -323,6 +393,8 @@ jobs:
         echo "=== free -h ==="; free -h || true
         echo "=== swapon ==="; swapon --show || true
         echo "=== watchdog log tail ==="; tail -n 60 "$GITHUB_WORKSPACE/build-watchdog.log" 2>/dev/null || tail -n 60 "$RUNNER_TEMP/build-watchdog.log" 2>/dev/null || true
+        echo "=== peak memory ==="; tail -n 30 "$GITHUB_WORKSPACE/peak-mem.txt" 2>/dev/null || true
+        echo "=== go heap env ==="; echo "GOGC=${GOGC:-unset} GOMEMLIMIT=${GOMEMLIMIT:-unset}"; grep -c . "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
         echo "=== build log tail (last 60) ==="; tail -n 60 "$GITHUB_WORKSPACE/build.log" 2>/dev/null || true
         tail -n 20000 "$GITHUB_WORKSPACE/build.log" > "$GITHUB_WORKSPACE/build-tail.log" 2>/dev/null || true
         tail -n 2000 "$GITHUB_WORKSPACE/build-watchdog.log" > "$GITHUB_WORKSPACE/watchdog-tail.log" 2>/dev/null || true
