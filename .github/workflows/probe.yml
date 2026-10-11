@@ -1,0 +1,12 @@
+name: runner probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest-8-cores
+    steps:
+      - name: report machine
+        run: |
+          echo "nproc=$(nproc)"
+          free -h
+          df -h /
