@@ -107,7 +107,8 @@ jobs:
       # sibling AERA device (cvhhji/android_device_oneplus_infiniti-AERA, three
       # green Android 16 recovery builds) is exactly this: plain rm -rf for
       # space, then a 12G extra swapfile on top of the image's ~3G /swapfile,
-      # then build in $HOME. We use 16G, giving ~19G of swap against 16G of RAM.
+      # then build in $HOME. We use 10G, giving ~13G of swap against 16G of RAM: a 16G
+      # swapfile left only ~119G free on / and the 2026-10-13 sync filled the rest.
     - name: Reclaim disk and add temporary swap
       run: |
         sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
@@ -115,7 +116,7 @@ jobs:
         df -h /
         sudo swapoff /swapfile-extra 2>/dev/null || true
         sudo rm -f /swapfile-extra
-        sudo fallocate -l 16G /swapfile-extra || sudo dd if=/dev/zero of=/swapfile-extra bs=1M count=16384 status=none
+        sudo fallocate -l 10G /swapfile-extra || sudo dd if=/dev/zero of=/swapfile-extra bs=1M count=10240 status=none
         sudo chmod 600 /swapfile-extra
         sudo mkswap /swapfile-extra
         sudo swapon /swapfile-extra
@@ -143,7 +144,7 @@ jobs:
         # is ~55G and out/ adds ~50G, so under 60G the runner would die silently
         # mid-build and take the job log with it.
         if [ "${ROOT_AVAIL_MB}" -lt 60000 ]; then
-          echo "::error::only ${ROOT_AVAIL_MB}MB free on / - expected ~119000 after the 16G swapfile"
+          echo "::error::only ${ROOT_AVAIL_MB}MB free on / - expected ~125000 after the 10G swapfile"
           exit 1
         fi
         if [ "${WS_AVAIL_MB}" -lt 60000 ]; then
@@ -178,7 +179,7 @@ jobs:
         grep -n "remote name=\"AERA\"" .repo/manifests/twrp-default.xml || true
         (while true; do echo "Syncing source..."; sleep 60; done) &
         TIP_PID=$!
-        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags || repo sync -c -j4
+        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune || repo sync -c -j4
         kill $TIP_PID 2>/dev/null || true
         echo "Removing .repo cache to free up ~20GB of disk space..."
         rm -rf .repo
