@@ -477,8 +477,12 @@ jobs:
         path: out/artifacts/*
 
     - name: Upload to Release
+      # The build lands as an unpublished draft release: nothing shows up on the
+      # public releases page (and nothing becomes "latest") until a human opens
+      # the release and publishes it.
       uses: softprops/action-gh-release@v2
       with:
+        draft: true
         files: | 
           out/artifacts/*
         name: AERA-Recovery-16.0-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}
