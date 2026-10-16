@@ -139,6 +139,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: success()
         with:
+          # 草稿发布：产物挂在草稿 release 上，需要人工点发布才对外可见
+          draft: true
           tag_name: AERA-${{ github.event.inputs.DEVICE_CODE }}-${{ github.run_id }}
           name: AERA Recovery for ${{ github.event.inputs.DEVICE_CODE }} (Android 16)
           files: |
