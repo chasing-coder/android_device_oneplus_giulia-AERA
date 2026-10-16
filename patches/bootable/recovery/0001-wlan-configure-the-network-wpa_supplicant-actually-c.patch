@@ -1,0 +1,297 @@
+From 84fe80f0557f0db219dfa58b80bce915312a85ae Mon Sep 17 00:00:00 2001
+From: cheng343 <203324649+cheng343@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 12:45:03 +0800
+Subject: [PATCH 1/3] wlan: configure the network wpa_supplicant actually
+ created
+
+Connect() dropped the id returned by ADD_NETWORK and then addressed network 0
+for SET_NETWORK/ENABLE_NETWORK/SELECT_NETWORK. wpa_supplicant never reuses an
+id, so once a previous attempt (or a saved network) had taken id 0, every later
+command addressed a network that did not exist. The FAIL reply was
+indistinguishable from success - both the control transport and the wpa_cli
+fallback report it as success - so the only symptom was a bare "association
+failed" after twelve 1.5s waits, with nothing in /tmp/recovery.log explaining
+it. On-device logs show the supplicant sitting in SCANNING/DISCONNECTED and
+never entering AUTHENTICATING: it was never asked to associate at all.
+
+* use the id returned by ADD_NETWORK for every network command
+* remove every stale entry of the target SSID, not only network 0
+* verify the SSID with GET_NETWORK before waiting for an association
+* treat FAIL/FAIL-BUSY/UNKNOWN COMMAND as failure in SuppCmd and log the
+  rejected command together with the supplicant's answer
+* dump STATUS and LIST_NETWORKS when the association wait fails
+* dump /tmp/dhcptool.log when dhcptool fails (it used to return silently)
+---
+ wlan.cpp | 176 ++++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 148 insertions(+), 28 deletions(-)
+
+diff --git a/wlan.cpp b/wlan.cpp
+index ef51095..5a8b125 100644
+--- a/wlan.cpp
++++ b/wlan.cpp
+@@ -142,6 +142,32 @@ static std::string HexEncode(const std::string& value) {
+     return encoded;
+ }
+ 
++/*
++ * wpa_supplicant answers every control command, including rejections, and the
++ * control transport hands that answer back verbatim: a bare "FAIL" means the
++ * command did NOT take effect. wpa_cli exits 0 in that case as well, so the
++ * reply itself has to decide. Without this check a rejected SET_NETWORK is
++ * indistinguishable from a configured network, and the only symptom left is a
++ * generic "association failed" roughly eighteen seconds later.
++ */
++static bool SupplicantRejected(const std::string& reply) {
++    size_t start = 0;
++    size_t end = reply.size();
++    while (start < end && std::isspace(static_cast<unsigned char>(reply[start])))
++        ++start;
++    while (end > start && std::isspace(static_cast<unsigned char>(reply[end - 1])))
++        --end;
++
++    const std::string trimmed = reply.substr(start, end - start);
++    /*
++     * Match the exact rejection tokens instead of a "FAIL" prefix: replies to
++     * data commands (GET_NETWORK, LIST_NETWORKS, SCAN_RESULTS) can legitimately
++     * begin with the same letters when an SSID does.
++     */
++    return trimmed == "FAIL" || trimmed == "FAIL-BUSY" ||
++           trimmed == "UNKNOWN COMMAND" || trimmed.rfind("FAIL\n", 0) == 0;
++}
++
+ static void SetWlanTestResult(const std::string& title,
+                               const std::string& line1,
+                               const std::string& line2,
+@@ -364,7 +390,6 @@ bool Wlan::Connect() {
+     gui_print("Remove old network config...\n");
+     std::string list_out;
+     if (SuppCmd("LIST_NETWORKS", list_out)) {
+-        bool has_net0 = false;
+         std::istringstream lss(list_out);
+         std::string lline;
+         bool first_line = true;
+@@ -379,19 +404,38 @@ bool Wlan::Connect() {
+             if (lline.empty())
+                 continue;
+ 
+-            if (lline.rfind("0\t", 0) == 0 || lline.rfind("0 ", 0) == 0 || lline == "0") {
+-                has_net0 = true;
+-                break;
++            std::vector<std::string> cols;
++            std::stringstream ls(lline);
++            std::string col;
++            while (std::getline(ls, col, '\t')) {
++                cols.push_back(col);
+             }
+-        }
+ 
+-        if (has_net0) {
+-            SuppCmd("REMOVE_NETWORK 0");
++            if (cols.empty())
++                continue;
++
++            const std::string row_id = Trim(cols[0]);
++            std::string row_ssid;
++            if (cols.size() > 1)
++                row_ssid = Trim(DecodeSupplicantText(cols[1]));
++
++            /*
++             * Drop every stale entry for this SSID, not just network 0.
++             * wpa_supplicant hands out the next free id from ADD_NETWORK, so a
++             * leftover entry with a higher id would leave the configuration
++             * below stranded on an id that is never touched again.
++             */
++            if (row_id == "0" || row_ssid == ssid) {
++                gui_print("WLAN: removing old network %s (ssid '%s')\n",
++                          row_id.c_str(), row_ssid.c_str());
++                SuppCmd("REMOVE_NETWORK " + row_id);
++            }
+         }
+     }
+ 
+     gui_print("Add new network config...\n");
+-    if (!SuppCmd("ADD_NETWORK")) {
++    std::string add_reply;
++    if (!SuppCmd("ADD_NETWORK", add_reply)) {
+         gui_print("WLAN: add_network failed\n");
+         DataManager::SetValue("wlan_connect_text", "Failed");
+         DataManager::SetValue("wlan_connect_done", 0);
+@@ -399,8 +443,27 @@ bool Wlan::Connect() {
+         return false;
+     }
+ 
++    /*
++     * ADD_NETWORK answers with the id of the network it created, and every
++     * later SET_NETWORK/ENABLE_NETWORK/SELECT_NETWORK has to use that id.
++     * Ids are never reused: hardcoding 0 configured nothing at all once a
++     * previous attempt had already taken id 0, and the only symptom left was
++     * a bare "association failed" eighteen seconds later.
++     */
++    const std::string network_id = Trim(add_reply);
++    if (network_id.empty() ||
++        network_id.find_first_not_of("0123456789") != std::string::npos) {
++        gui_print("WLAN: add_network returned an unusable id '%s'\n",
++                  network_id.c_str());
++        DataManager::SetValue("wlan_connect_text", "Failed");
++        DataManager::SetValue("wlan_connect_done", 0);
++        DataManager::SetValue("tw_wlan_connected", 0);
++        return false;
++    }
++    gui_print("WLAN: new network id %s\n", network_id.c_str());
++
+     gui_print("Add SSID to new config...\n");
+-    if (!SuppCmd("SET_NETWORK 0 ssid " + HexEncode(ssid))) {
++    if (!SuppCmd("SET_NETWORK " + network_id + " ssid " + HexEncode(ssid))) {
+         gui_print("WLAN: failed setting SSID\n");
+         DataManager::SetValue("wlan_connect_text", "Failed");
+         DataManager::SetValue("wlan_connect_done", 0);
+@@ -408,8 +471,26 @@ bool Wlan::Connect() {
+         return false;
+     }
+ 
++    /*
++     * Prove the SSID landed before waiting eighteen seconds for an association
++     * that cannot happen. A rejected SET_NETWORK used to look like a success
++     * because the supplicant's FAIL reply was never inspected.
++     */
++    std::string ssid_check;
++    if (!SuppCmd("GET_NETWORK " + network_id + " ssid", ssid_check) ||
++        Trim(ssid_check).empty()) {
++        gui_print("WLAN: network %s holds no SSID after SET_NETWORK\n",
++                  network_id.c_str());
++        DataManager::SetValue("wlan_connect_text", "Failed");
++        DataManager::SetValue("wlan_connect_done", 0);
++        DataManager::SetValue("tw_wlan_connected", 0);
++        return false;
++    }
++    gui_print("WLAN: network %s ssid verified: %s\n", network_id.c_str(),
++              Trim(ssid_check).c_str());
++
+     gui_print("Add encryption to new config...\n");
+-    if (!SuppCmd("SET_NETWORK 0 key_mgmt " + key_mgmt)) {
++    if (!SuppCmd("SET_NETWORK " + network_id + " key_mgmt " + key_mgmt)) {
+         gui_print("WLAN: failed setting key_mgmt\n");
+         DataManager::SetValue("wlan_connect_text", "Failed");
+         DataManager::SetValue("wlan_connect_done", 0);
+@@ -423,9 +504,9 @@ bool Wlan::Connect() {
+ 
+         bool pass_ok = false;
+         if (key_mgmt == "SAE") {
+-            pass_ok = SuppCmd("SET_NETWORK 0 sae_password \"" + esc_pass + "\"");
++            pass_ok = SuppCmd("SET_NETWORK " + network_id + " sae_password \"" + esc_pass + "\"");
+         } else {
+-            pass_ok = SuppCmd("SET_NETWORK 0 psk \"" + esc_pass + "\"");
++            pass_ok = SuppCmd("SET_NETWORK " + network_id + " psk \"" + esc_pass + "\"");
+         }
+ 
+         if (!pass_ok) {
+@@ -438,7 +519,7 @@ bool Wlan::Connect() {
+     }
+ 
+     gui_print("Enable new config for network...\n");
+-    if (!SuppCmd("ENABLE_NETWORK 0")) {
++    if (!SuppCmd("ENABLE_NETWORK " + network_id)) {
+         gui_print("WLAN: enable_network failed\n");
+         DataManager::SetValue("wlan_connect_text", "Failed");
+         DataManager::SetValue("wlan_connect_done", 0);
+@@ -447,7 +528,7 @@ bool Wlan::Connect() {
+     }
+ 
+     gui_print("Select new config for network...\n");
+-    if (!SuppCmd("SELECT_NETWORK 0")) {
++    if (!SuppCmd("SELECT_NETWORK " + network_id)) {
+         gui_print("WLAN: select_network failed\n");
+         DataManager::SetValue("wlan_connect_text", "Failed");
+         DataManager::SetValue("wlan_connect_done", 0);
+@@ -502,6 +583,19 @@ bool Wlan::Connect() {
+     if (!completed) {
+         gui_print(" \n");
+         gui_print("WLAN: association failed\n");
++        /*
++         * Leave the supplicant's own view behind. Which wpa_state the wait
++         * ended on, and whether the selected network even carries the SSID we
++         * asked for, is the only way to tell a rejected key apart from a
++         * network that was never configured in the first place.
++         */
++        std::string failure_status;
++        if (SuppCmd("STATUS", failure_status))
++            gui_print("WLAN: STATUS after failure:\n%s\n", failure_status.c_str());
++        std::string failure_networks;
++        if (SuppCmd("LIST_NETWORKS", failure_networks))
++            gui_print("WLAN: LIST_NETWORKS after failure:\n%s\n",
++                      failure_networks.c_str());
+         DataManager::SetValue("wlan_connect_text", "Failed");
+         DataManager::SetValue("wlan_connect_done", 0);
+         DataManager::SetValue("tw_wlan_connected", 0);
+@@ -1362,8 +1456,16 @@ bool Wlan::StartDhcp() {
+         return false;
+     }
+ 
+-    if (!RunCommand(dhcptool + " " + iface + " >/tmp/dhcptool.log 2>&1"))
++    if (!RunCommand(dhcptool + " " + iface + " >/tmp/dhcptool.log 2>&1")) {
++        // The exit status alone says nothing about why; dhcptool's own output is
++        // the only record of why the lease never arrived.
++        std::string dhcp_log;
++        if (ReadFile("/tmp/dhcptool.log", dhcp_log) && !Trim(dhcp_log).empty())
++            gui_print("WLAN: dhcptool failed, output:\n%s\n", dhcp_log.c_str());
++        else
++            gui_print("WLAN: dhcptool failed with no output\n");
+         return false;
++    }
+ 
+     /*
+      * dhcptool publishes DNS servers as Android properties, but recovery has
+@@ -1700,22 +1802,40 @@ void Wlan::RefreshWlanPageIfShown() {
+ bool Wlan::SuppCmd(const std::string& ctrl_cmd, std::string& out) {
+     std::lock_guard<std::mutex> lk(g_supp_mutex);
+ 
+-    if (EnsureSuppChannel() && g_supp_cmd.Execute(ctrl_cmd, &out))
+-        return true;
+-
+-    // Fallback: the control socket is unavailable — shell out to wpa_cli,
+-    // passing the ctrl command as one shell-quoted argument so wpa_cli forwards
+-    // it unchanged. Drop the stale connection so we retry opening it next time.
+-    g_supp_cmd.Reset();
+-    g_supp_mon.Reset();
++    bool transported = false;
++    if (EnsureSuppChannel() && g_supp_cmd.Execute(ctrl_cmd, &out)) {
++        transported = true;
++    } else {
++        // Fallback: the control socket is unavailable — shell out to wpa_cli,
++        // passing the ctrl command as one shell-quoted argument so wpa_cli
++        // forwards it unchanged. Drop the stale connection so we retry opening
++        // it next time.
++        g_supp_cmd.Reset();
++        g_supp_mon.Reset();
++
++        const std::string wpacli = GetWpaCliBinary();
++        if (!wpacli.empty()) {
++            const std::string cmd = wpacli + " -i " + GetIface() + " -p " + GetCtrlDir() +
++                                    " " + ShellSingleQuote(ctrl_cmd);
++            transported = RunCommand(cmd, out);
++        }
++    }
+ 
+-    const std::string wpacli = GetWpaCliBinary();
+-    if (wpacli.empty())
++    /*
++     * A transported command is not a successful one: wpa_supplicant answers
++     * "FAIL" when it refuses, and both transports report that as success (the
++     * raw reply here, wpa_cli's exit status 0 in the fallback). Report the
++     * rejection together with the command that caused it, so a failed connect
++     * leaves evidence in /tmp/recovery.log instead of a bare "association
++     * failed".
++     */
++    if (transported && SupplicantRejected(out)) {
++        gui_print("WLAN: supplicant rejected '%s' -> %s\n", ctrl_cmd.c_str(),
++                  Trim(out).c_str());
+         return false;
++    }
+ 
+-    const std::string cmd = wpacli + " -i " + GetIface() + " -p " + GetCtrlDir() +
+-                            " " + ShellSingleQuote(ctrl_cmd);
+-    return RunCommand(cmd, out);
++    return transported;
+ }
+ 
+ bool Wlan::SuppCmd(const std::string& ctrl_cmd) {

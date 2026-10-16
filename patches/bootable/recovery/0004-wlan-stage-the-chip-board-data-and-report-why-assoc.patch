@@ -1,0 +1,694 @@
+From c76c95b878e5e2e7c6b5f7172d8d792b1feff41a Mon Sep 17 00:00:00 2001
+From: cheng343 <203324649+cheng343@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 18:56:50 +0800
+Subject: [PATCH] wlan: stage the chip board data and report why an association
+ fails
+
+Recovery boots with the kernel firmware loader pointed at the ramdisk
+(firmware_class.path=/vendor/firmware) because the modem vfat mount cannot
+be traversed from the kernel domain under recovery SELinux. The board data
+this device's WLAN driver needs (bdwlan*, regdb*) only exists on that modem
+image, and the ramdisk ships the Waffle-era chip directory name "kiwi" while
+the device reports "kiwi_v2" - so the driver came up without its board data
+and every association attempt died without a single line of explanation.
+
+The device's own board data is also per-unit: the modem image carries the
+segmented bdwlan.e01..bdwlan.e3d set for the eFuse revisions while the tree
+bundles only the generic bdwlan.b0c/bdwlan.elf copies. A driver that cannot
+find the calibration matching its eFuse quietly falls back to the generic
+image - enough to scan, not enough to associate.
+
+* StageDriverFirmware() copies the chip's board data out of the modem image
+  (mounting it first when boot has not) into the directory spellings the
+  driver probes, serving both "kiwi" and "kiwi_v2" and reading the payload
+  from /vendor/firmware_mnt/image and /firmware/image alike. Called from
+  Init() and Enable() so a late mount is still covered.
+* A stale real directory at an alias path is merged into the canonical store
+  before the symlink replaces it, so a bundled payload is never deleted.
+* Connect() scans first, pins the BSS the selected SSID is actually
+  visible on, asks for PMF explicitly, and retries without the pin when
+  the pinned attempt fails.
+* A failed association now dumps STATUS, LIST_NETWORKS, GET_NETWORK and
+  the SSID's SCAN_RESULTS rows plus the WLAN lines of the kernel ring
+  buffer, so the next report carries the driver's own verdict.
+---
+ wlan.cpp | 543 ++++++++++++++++++++++++++++++++++++++++++++++++++++---
+ wlan.hpp |  21 +++
+ 2 files changed, 541 insertions(+), 23 deletions(-)
+
+diff --git a/wlan.cpp b/wlan.cpp
+index 5a8b125..b63e749 100644
+--- a/wlan.cpp
++++ b/wlan.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ #include <cerrno>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <dirent.h>
+ #include <fstream>
+@@ -71,6 +72,29 @@ static constexpr int WLAN_SUPP_READY_TIMEOUT_MS = 60000;
+  * wrapper (mondrian_wlan_up.sh); it is now native init builtins. */
+ static const char* WLAN_SUPP_PREP_PROP = "sys.aera.wlan.up";
+ 
++/* Board data used by the QCA driver. The tree bundles Waffle-era copies under
++ * the chip directory "kiwi" (recovery/root/vendor/etc/wifi/kiwi and
++ * recovery/root/vendor/odm/firmware/kiwi), but this device reports the chip as
++ * "kiwi_v2" and keeps its authoritative copies on the modem partition, which
++ * the kernel firmware loader cannot reach under recovery SELinux (see the
++ * firmware_class `path` override in init.recovery.qcom.rc). Wlan::Init() copies
++ * the payload into the ramdisk before the driver asks for it. */
++static const char* WLAN_MODEM_PARTITION     = "/dev/block/bootdevice/by-name/modem";
++static const char* WLAN_FIRMWARE_IMAGE_ROOT = "/vendor/firmware_mnt/image";
++/* The init trigger mounts the modem image at /firmware and only links it to
++ * /vendor/firmware_mnt afterwards; staging may well run before that link. */
++static const char* WLAN_MODEM_MOUNT         = "/firmware";
++static const char* WLAN_CHIP_FALLBACK       = "kiwi";
++/* The vendor tree loads qca_cld3_kiwi_v2, so the chip directory can be spelled
++ * either way. Serve both spellings instead of guessing which one the driver
++ * asks the firmware loader for. */
++static const char* WLAN_CHIP_ALIAS          = "kiwi_v2";
++/* firmware_class resolves relative requests here, so both "<chip>/..." and
++ * "image/<chip>/..." spellings have to exist as well. */
++static const char* WLAN_FIRMWARE_ROOT       = "/vendor/firmware";
++/* Refuse to balloon the ramdisk if a vendor tree ships an unusually fat set. */
++static constexpr size_t WLAN_BOARD_DATA_MAX_BYTES = 24 * 1024 * 1024;
++
+ static int HexDigitValue(char value) {
+     if (value >= '0' && value <= '9') return value - '0';
+     if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+@@ -206,6 +230,11 @@ static bool OF_GetEncryptedSavedSsids(std::vector<std::string>& ssids)
+ }
+ 
+ bool Wlan::Init() {
++    // The chip only loads board data that exists inside the ramdisk; stage it
++    // before the driver (and the MAC preparation below) looks for it.
++    if (!StageDriverFirmware())
++        LOGERR("WLAN: driver board data was not staged; bundled copies remain\n");
++
+     // Qualcomm selects the interface MAC while the WLAN module is loading.
+     // Prepare its config and firmware file now, before post-decrypt modules
+     // create wlan0. Runtime SIOCSIFHWADDR is rejected by newer QCA drivers.
+@@ -229,6 +258,11 @@ bool Wlan::Enable() {
+     std::lock_guard<std::recursive_mutex> op(g_wlan_op_mutex);
+     EnsureTmpLayout();
+ 
++    // The modem image is mounted by the time the user enables Wi-Fi, so this is
++    // the last chance to get the device's own board data into the ramdisk
++    // before the driver powers the chip up.
++    StageDriverFirmware();
++
+     if (!StartSupplicant()) {
+         DataManager::SetValue("tw_wlan_enabled", 0);
+         DataManager::SetValue("tw_wlan_connected", 0);
+@@ -330,6 +364,165 @@ bool Wlan::Scan() {
+     return false;
+ }
+ 
++namespace {
++std::string TrimSpaces(const std::string& s) {
++    size_t start = 0;
++    while (start < s.size() && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' ||
++                                s[start] == '\n'))
++        ++start;
++
++    size_t end = s.size();
++    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r' ||
++                           s[end - 1] == '\n'))
++        --end;
++
++    return s.substr(start, end - start);
++}
++
++// SCAN_RESULTS separates its columns with tabs:
++//   bssid / frequency / signal level / flags / ssid
++std::vector<std::string> SplitTabs(const std::string& line) {
++    std::vector<std::string> cols;
++    std::string col;
++    std::istringstream stream(line);
++    while (std::getline(stream, col, '\t'))
++        cols.push_back(col);
++    return cols;
++}
++}  // namespace
++
++std::string Wlan::FindBssidForSsid(const std::string& ssid) {
++    std::string scan_results;
++    if (!SuppCmd("SCAN_RESULTS", scan_results))
++        return "";
++
++    std::string best_bssid;
++    int best_signal = -1000;
++    std::istringstream stream(scan_results);
++    std::string line;
++
++    while (std::getline(stream, line)) {
++        const std::vector<std::string> cols = SplitTabs(line);
++        if (cols.size() < 5 || DecodeSupplicantText(cols[4]) != ssid)
++            continue;
++
++        const int signal = std::atoi(TrimSpaces(cols[2]).c_str());
++        if (best_bssid.empty() || signal > best_signal) {
++            best_signal = signal;
++            best_bssid = TrimSpaces(cols[0]);
++        }
++    }
++    return best_bssid;
++}
++
++void Wlan::DumpScanResultsForSsid(const std::string& ssid) {
++    std::string scan_results;
++    if (!SuppCmd("SCAN_RESULTS", scan_results)) {
++        gui_print("WLAN: SCAN_RESULTS unavailable\n");
++        return;
++    }
++
++    bool any = false;
++    std::istringstream stream(scan_results);
++    std::string line;
++
++    while (std::getline(stream, line)) {
++        const std::vector<std::string> cols = SplitTabs(line);
++        if (cols.size() < 5 || DecodeSupplicantText(cols[4]) != ssid)
++            continue;
++        gui_print("WLAN: scan row %s\n", TrimSpaces(line).c_str());
++        any = true;
++    }
++
++    if (!any)
++        gui_print("WLAN: SSID '%s' is absent from SCAN_RESULTS\n", ssid.c_str());
++}
++
++bool Wlan::WaitForAssociation(const std::string& ssid, int tries, const char* tag) {
++    for (int attempt = 0; attempt < tries; ++attempt) {
++        std::string event;
++        const bool got_event = SuppWaitEvent({"CTRL-EVENT-CONNECTED", "CTRL-EVENT-DISCONNECTED",
++                                             "CTRL-EVENT-ASSOC-REJECT", "CTRL-EVENT-AUTH-REJECT"},
++                                            1500, event);
++
++        std::string status;
++        if (SuppCmd("STATUS", status)) {
++            std::string wpa_state;
++            std::string current_ssid;
++            std::string ip_addr;
++            ParseSupplicantStatus(status, wpa_state, current_ssid, ip_addr);
++
++            gui_print("Connection state (%s): %s (%d/%d)\n", tag, wpa_state.c_str(), attempt + 1,
++                      tries);
++
++            if (wpa_state == "COMPLETED" && current_ssid == ssid)
++                return true;
++        }
++
++        if (!got_event)
++            usleep(500 * 1000);
++    }
++    return false;
++}
++
++void Wlan::DumpDriverLog(const char* why) {
++    gui_print("WLAN: driver log (%s)\n", why);
++
++    const std::string iface = GetIface();
++    std::string operstate;
++    if (ReadFile("/sys/class/net/" + iface + "/operstate", operstate))
++        gui_print("WLAN: %s operstate=%s\n", iface.c_str(), Trim(operstate).c_str());
++
++    std::string wireless;
++    if (ReadFile("/proc/net/wireless", wireless))
++        gui_print("WLAN: /proc/net/wireless:\n%s\n", wireless.c_str());
++
++    const std::string busybox = GetBusyboxBinary();
++    if (busybox.empty()) {
++        gui_print("WLAN: no busybox, kernel ring buffer not readable\n");
++        return;
++    }
++
++    /*
++     * The supplicant runs with -dd and the cnss/qca drivers log to the kernel
++     * ring buffer, not to /tmp/recovery.log — so this is the only place the
++     * driver's own verdict about the association attempt shows up.
++     */
++    std::string dmesg;
++    if (!RunCommand(busybox + " dmesg 2>&1", dmesg)) {
++        gui_print("WLAN: dmesg unavailable (SELinux or dmesg_restrict)\n");
++        return;
++    }
++
++    static const char* keys[] = {"wlan", "cnss", "qca", "kiwi",  "cfg80211",   "wpa_supp",
++                                 "supplicant", "firmware", "bdwlan"};
++    std::vector<std::string> matched;
++    std::istringstream stream(dmesg);
++    std::string line;
++
++    while (std::getline(stream, line)) {
++        std::string lowered;
++        lowered.reserve(line.size());
++        for (size_t i = 0; i < line.size(); ++i)
++            lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(line[i]))));
++
++        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
++            if (lowered.find(keys[i]) != std::string::npos) {
++                matched.push_back(line);
++                break;
++            }
++        }
++    }
++
++    const size_t keep = 40;
++    const size_t start = matched.size() > keep ? matched.size() - keep : 0;
++    for (size_t i = start; i < matched.size(); ++i)
++        gui_print("WLAN dmesg: %s\n", matched[i].c_str());
++
++    if (matched.empty())
++        gui_print("WLAN: kernel ring buffer holds no WLAN driver lines\n");
++}
++
+ bool Wlan::Connect() {
+     std::lock_guard<std::recursive_mutex> op(g_wlan_op_mutex);
+     DataManager::SetValue("wlan_connect_text", "Connecting");
+@@ -387,6 +580,24 @@ bool Wlan::Connect() {
+     gui_print("Encryption: %s (key_mgmt: %s)\n", enc.c_str(), key_mgmt.c_str());
+     gui_print(" \n");
+ 
++    /*
++     * A supplicant can only associate with a BSS it has already seen. Force a
++     * fresh scan and record whether the target shows up at all: that separates
++     * "the driver cannot join this AP" from "the driver never saw the network",
++     * which the previous flow could not tell apart.
++     */
++    gui_print("Scanning before connect...\n");
++    SuppCmd("SCAN");
++
++    std::string scan_event;
++    SuppWaitEvent({"CTRL-EVENT-SCAN-RESULTS"}, 8000, scan_event);
++
++    const std::string target_bssid = FindBssidForSsid(ssid);
++    if (target_bssid.empty())
++        gui_print("WLAN: target SSID '%s' is not visible in scan results\n", ssid.c_str());
++    else
++        gui_print("WLAN: target SSID '%s' visible on %s\n", ssid.c_str(), target_bssid.c_str());
++
+     gui_print("Remove old network config...\n");
+     std::string list_out;
+     if (SuppCmd("LIST_NETWORKS", list_out)) {
+@@ -518,6 +729,25 @@ bool Wlan::Connect() {
+         }
+     }
+ 
++    /*
++     * The device's own Android supplicant conf sets pmf=1, and a WPA3 or
++     * PMF-required AP rejects an association that never negotiated MFP. "1"
++     * means "capable", which a plain WPA2-PSK AP simply ignores.
++     */
++    if (key_mgmt != "NONE")
++        SuppCmd("SET_NETWORK " + network_id + " ieee80211w 1");
++
++    /*
++     * Pin the strongest BSS of the target SSID. A driver that cannot reach the
++     * AP then fails immediately and visibly instead of sitting in SCANNING, and
++     * the failure dump below records which BSS was pinned.
++     */
++    if (!target_bssid.empty()) {
++        gui_print("Pinning network %s to BSS %s...\n", network_id.c_str(), target_bssid.c_str());
++        if (!SuppCmd("SET_NETWORK " + network_id + " bssid " + target_bssid))
++            gui_print("WLAN: pinning to %s failed\n", target_bssid.c_str());
++    }
++
+     gui_print("Enable new config for network...\n");
+     if (!SuppCmd("ENABLE_NETWORK " + network_id)) {
+         gui_print("WLAN: enable_network failed\n");
+@@ -551,33 +781,23 @@ bool Wlan::Connect() {
+ 
+     // Wait for association via supplicant events instead of polling STATUS on a
+     // fixed 1s cadence: each iteration blocks up to 1.5s for a relevant event,
+-    // then confirms the SSID via STATUS. Bounded to ~15s worst case but returns
++    // then confirms the SSID via STATUS. Bounded to ~30s worst case but returns
+     // the instant CTRL-EVENT-CONNECTED lands.
+-    bool completed = false;
+-
+-    for (int tries = 0; tries < 12 && !completed; ++tries) {
+-        std::string ev;
+-        bool got_event = SuppWaitEvent({"CTRL-EVENT-CONNECTED", "CTRL-EVENT-DISCONNECTED",
+-                                        "CTRL-EVENT-ASSOC-REJECT", "CTRL-EVENT-AUTH-REJECT"},
+-                                       1500, ev);
+-
+-        std::string status;
+-        if (SuppCmd("STATUS", status)) {
+-            std::string wpa_state;
+-            std::string current_ssid;
+-            std::string ip_addr;
+-            ParseSupplicantStatus(status, wpa_state, current_ssid, ip_addr);
++    bool completed = WaitForAssociation(ssid, 20, "connect");
+ 
+-            gui_print("Connection state: %s (%d/12)\n", wpa_state.c_str(), tries);
++    if (!completed && !target_bssid.empty()) {
++        /*
++         * The pinned BSS may be the wrong member of a mesh, or its radio may be
++         * the one this driver cannot reach. Retry once unpinned so the
++         * supplicant may pick any BSS of the same SSID itself.
++         */
++        gui_print("WLAN: retrying without a pinned BSS\n");
++        SuppCmd("SET_NETWORK " + network_id + " bssid 00:00:00:00:00:00");
+ 
+-            if (wpa_state == "COMPLETED" && current_ssid == ssid) {
+-                completed = true;
+-                break;
+-            }
++        if (SuppCmd("SELECT_NETWORK " + network_id)) {
++            SuppCmd("RECONNECT");
++            completed = WaitForAssociation(ssid, 8, "retry");
+         }
+-
+-        if (!got_event)
+-            usleep(500 * 1000);
+     }
+ 
+     if (!completed) {
+@@ -596,6 +816,27 @@ bool Wlan::Connect() {
+         if (SuppCmd("LIST_NETWORKS", failure_networks))
+             gui_print("WLAN: LIST_NETWORKS after failure:\n%s\n",
+                       failure_networks.c_str());
++
++        /*
++         * What the supplicant stored for the network it was asked to join. A
++         * missing SSID or an unexpected key_mgmt here explains the failure
++         * without a second device round trip.
++         */
++        std::string stored;
++        if (SuppCmd("GET_NETWORK " + network_id + " ssid", stored))
++            gui_print("WLAN: network %s ssid='%s'\n", network_id.c_str(), Trim(stored).c_str());
++        if (SuppCmd("GET_NETWORK " + network_id + " key_mgmt", stored))
++            gui_print("WLAN: network %s key_mgmt=%s\n", network_id.c_str(), Trim(stored).c_str());
++        if (SuppCmd("GET_NETWORK " + network_id + " ieee80211w", stored))
++            gui_print("WLAN: network %s ieee80211w=%s\n", network_id.c_str(), Trim(stored).c_str());
++        if (SuppCmd("GET_NETWORK " + network_id + " psk", stored))
++            // Presence only: the passphrase itself never belongs in a log.
++            gui_print("WLAN: network %s psk set: %s\n", network_id.c_str(),
++                      Trim(stored).empty() ? "no" : "yes");
++
++        DumpScanResultsForSsid(ssid);
++        DumpDriverLog("association failed");
++
+         DataManager::SetValue("wlan_connect_text", "Failed");
+         DataManager::SetValue("wlan_connect_done", 0);
+         DataManager::SetValue("tw_wlan_connected", 0);
+@@ -1285,6 +1526,262 @@ bool Wlan::StartSupplicant() {
+     return StartInitSupplicantService();
+ }
+ 
++namespace {
++// True for the file names the QCA driver may load from its chip directory: the
++// ELF/segmented board data, the regulatory database, and the NV config.
++bool IsWlanBoardDataName(const std::string& name) {
++    if (name.compare(0, 7, "bdwlan.") == 0)
++        return true;
++    if (name == "regdb.bin" || name == "regdb_version" || name == "bin_version")
++        return true;
++    if (name == "WCNSS_qcom_cfg.ini")
++        return true;
++    /* Deterministic MAC written by PrepareStableMacFirmware(). */
++    if (name == "wlan_mac.bin")
++        return true;
++    return false;
++}
++
++// Comma-separated list for the log lines; the set stays small.
++std::string JoinNames(const std::set<std::string>& names) {
++    std::string joined;
++    for (std::set<std::string>::const_iterator it = names.begin(); it != names.end(); ++it) {
++        if (!joined.empty())
++            joined += ",";
++        joined += *it;
++    }
++    return joined;
++}
++
++// Collects one directory level of `root` into `names`. Missing roots are fine.
++void CollectSubdirs(const std::string& root, std::set<std::string>& names) {
++    DIR* dir = opendir(root.c_str());
++    if (!dir)
++        return;
++
++    while (struct dirent* entry = readdir(dir)) {
++        const std::string name = entry->d_name;
++        if (name.empty() || name[0] == '.')
++            continue;
++        names.insert(name);
++    }
++    closedir(dir);
++}
++}  // namespace
++
++/*
++ * Keeps the driver's firmware load inside the ramdisk.
++ *
++ * Under recovery the kernel domain cannot traverse the vfat modem mount, so the
++ * firmware_class `path` override in init.recovery.qcom.rc points the loader at
++ * the ramdisk (/vendor/firmware). Whatever the chip asks for therefore has to
++ * be copied out of the modem image by userspace first — and the copies bundled
++ * in this device tree use the Waffle-era directory name "kiwi" while the device
++ * itself reports "kiwi_v2". The payload is copied exactly once and every other
++ * spelling is a symlink to it, so the ramdisk grows by a single copy.
++ *
++ * The device's own board data is also per-unit: the modem image carries the
++ * segmented bdwlan.e01..bdwlan.e3d set for the eFuse revisions, while the tree
++ * only bundles the generic bdwlan.b0c/bdwlan.elf copies. A driver that cannot
++ * find the calibration matching its eFuse quietly falls back to the generic
++ * image, which is enough to scan but not enough to associate.
++ */
++bool Wlan::StageDriverFirmware() {
++    // The vendor fstab mount lives on the modem partition; bring it up if the
++    // init trigger has not run yet. Userspace may read that mount even though
++    // the kernel firmware loader may not.
++    if (!FileExists(WLAN_FIRMWARE_IMAGE_ROOT) && FileExists(WLAN_MODEM_PARTITION)) {
++        char slot[PROPERTY_VALUE_MAX] = {0};
++        property_get("ro.boot.slot_suffix", slot, "");
++        if (RunCommand(std::string("mkdir -p ") + WLAN_MODEM_MOUNT + " && mount vfat " +
++                       WLAN_MODEM_PARTITION + slot + " " + WLAN_MODEM_MOUNT + " ro"))
++            LOGINFO("WLAN: mounted the modem image at %s\n", WLAN_MODEM_MOUNT);
++    }
++
++    const std::vector<std::string> source_roots = {
++        WLAN_FIRMWARE_IMAGE_ROOT,
++        std::string(WLAN_MODEM_MOUNT) + "/image",
++        "/odm/etc/wifi",
++        "/vendor/odm/etc/wifi",
++        "/vendor/etc/wifi",
++        "/vendor/odm/firmware",
++    };
++
++    // Chip directory names to serve: everything a source exposes, the module
++    // name the driver registered (qca_cld3_kiwi_v2 -> kiwi_v2), and the
++    // fallback spelling the bundled copies use.
++    std::set<std::string> chips;
++    chips.insert(WLAN_CHIP_FALLBACK);
++    chips.insert(WLAN_CHIP_ALIAS);
++
++    DIR* modules = opendir("/sys/module");
++    if (modules) {
++        while (struct dirent* entry = readdir(modules)) {
++            const std::string name = entry->d_name;
++            const std::string prefix = "qca_cld3_";
++            if (name.compare(0, prefix.size(), prefix) == 0 && name.size() > prefix.size())
++                chips.insert(name.substr(prefix.size()));
++        }
++        closedir(modules);
++    }
++
++    for (size_t i = 0; i < source_roots.size(); ++i) {
++        std::set<std::string> names;
++        CollectSubdirs(source_roots[i], names);
++
++        for (std::set<std::string>::const_iterator it = names.begin(); it != names.end(); ++it) {
++            const std::string dir = source_roots[i] + "/" + *it;
++            if (FileExists(dir + "/bdwlan.elf") || FileExists(dir + "/bdwlan.b0c") ||
++                FileExists(dir + "/regdb.bin"))
++                chips.insert(*it);
++        }
++    }
++
++    // One source per file name, most authoritative first: the device's own
++    // modem image beats the odm copies, which beat the bundled ramdisk ones.
++    std::map<std::string, std::string> chosen;
++    for (size_t i = 0; i < source_roots.size(); ++i) {
++        for (std::set<std::string>::const_iterator chip = chips.begin(); chip != chips.end(); ++chip) {
++            const std::string dir = source_roots[i] + "/" + *chip;
++            DIR* dh = opendir(dir.c_str());
++            if (!dh)
++                continue;
++
++            while (struct dirent* entry = readdir(dh)) {
++                const std::string name = entry->d_name;
++                if (!IsWlanBoardDataName(name))
++                    continue;
++                if (chosen.find(name) == chosen.end()) {
++                    chosen[name] = dir + "/" + name;
++                    gui_print("WLAN: board data %s <- %s\n", name.c_str(), chosen[name].c_str());
++                }
++            }
++            closedir(dh);
++        }
++    }
++
++    if (chosen.empty()) {
++        LOGERR("WLAN: no board data found (chip names tried: %s, looked under %s and the odm/ramdisk copies)\n",
++               JoinNames(chips).c_str(), WLAN_FIRMWARE_IMAGE_ROOT);
++        return false;
++    }
++
++    // Canonical store: <firmware root>/<first chip name>, alphabetically first
++    // so the modem image's own spelling wins.
++    const std::string store = std::string(WLAN_FIRMWARE_ROOT) + "/" + *chips.begin();
++    if (!MkdirRecursive(store))
++        return false;
++
++    size_t staged_bytes = 0;
++    size_t staged_files = 0;
++    bool capped = false;
++
++    for (std::map<std::string, std::string>::const_iterator it = chosen.begin();
++         it != chosen.end(); ++it) {
++        std::string payload;
++        if (!ReadFile(it->second, payload))
++            continue;
++        if (staged_bytes + payload.size() > WLAN_BOARD_DATA_MAX_BYTES) {
++            capped = true;
++            continue;
++        }
++        if (!WriteFile(store + "/" + it->first, payload))
++            continue;
++
++        staged_bytes += payload.size();
++        ++staged_files;
++    }
++
++    if (staged_files == 0) {
++        LOGERR("WLAN: board data could not be staged into %s\n", store.c_str());
++        return false;
++    }
++
++    /*
++     * Every other directory spelling: the remaining chip names, both loader
++     * spellings under the firmware root ("<chip>" and "image/<chip>"), the
++     * qca_cld config directory the driver reads NV items from, and the etc/wifi
++     * copy PrepareStableMacFirmware() scans for WCNSS_qcom_cfg.ini.
++     */
++    const std::vector<std::string> alias_dirs = {
++        std::string(WLAN_FIRMWARE_ROOT) + "/image",
++        std::string(WLAN_FIRMWARE_ROOT) + "/wlan/qca_cld",
++        "/vendor/etc/wifi",
++        "/vendor/odm/firmware",
++    };
++
++    // A real directory at an alias path (the bundled copies use the old chip
++    // name) must be merged into the store before the link replaces it: deleting
++    // it outright would throw away board data this run did not pick up.
++    const auto MergeIntoStore = [](const std::string& from, const std::string& to) {
++        DIR* dh = opendir(from.c_str());
++        if (!dh)
++            return;
++
++        while (struct dirent* entry = readdir(dh)) {
++            const std::string name = entry->d_name;
++            if (name.empty() || name[0] == '.')
++                continue;
++
++            const std::string dst = to + "/" + name;
++            if (FileExists(dst))
++                continue;
++
++            std::string payload;
++            if (!ReadFile(from + "/" + name, payload))
++                continue;
++            if (WriteFile(dst, payload))
++                gui_print("WLAN: kept bundled board data %s\n", name.c_str());
++        }
++        closedir(dh);
++    };
++
++    // Points `link` at `target`, replacing whatever is there: a real directory
++    // (the bundled Waffle copies use the old chip name) would otherwise swallow
++    // the link and create it one level too deep.
++    const auto Relink = [&MergeIntoStore](const std::string& target, const std::string& link) {
++        char resolved[4096] = {0};
++        const ssize_t got = readlink(link.c_str(), resolved, sizeof(resolved) - 1);
++        if (got > 0 && std::string(resolved, static_cast<size_t>(got)) == target)
++            return;
++
++        if (symlink(target.c_str(), link.c_str()) == 0)
++            return;
++
++        if (errno != EEXIST) {
++            LOGERR("WLAN: cannot link %s -> %s: %s\n", link.c_str(), target.c_str(),
++                   strerror(errno));
++            return;
++        }
++
++        MergeIntoStore(link, target);
++        Wlan::RunCommand("rm -rf " + link);
++        if (symlink(target.c_str(), link.c_str()) != 0)
++            LOGERR("WLAN: cannot link %s -> %s: %s\n", link.c_str(), target.c_str(),
++                   strerror(errno));
++    };
++
++    for (std::set<std::string>::const_iterator chip = chips.begin(); chip != chips.end(); ++chip) {
++        for (size_t i = 0; i < alias_dirs.size(); ++i) {
++            const std::string link = alias_dirs[i] + "/" + *chip;
++            if (link == store)
++                continue;
++            MkdirRecursive(alias_dirs[i]);
++            Relink(store, link);
++        }
++    }
++
++    // A bare request ("bdwlan.elf") resolves against the firmware root itself.
++    for (std::map<std::string, std::string>::const_iterator it = chosen.begin();
++         it != chosen.end(); ++it)
++        Relink(store + "/" + it->first, std::string(WLAN_FIRMWARE_ROOT) + "/" + it->first);
++
++    gui_print("WLAN: staged %zu board-data file(s) (%zu bytes) into %s; chip names: %s%s\n",
++              staged_files, staged_bytes, store.c_str(), JoinNames(chips).c_str(),
++              capped ? " (payload capped)" : "");
++    return true;
++}
++
+ bool Wlan::PrepareStableMacFirmware() {
+     char serial_prop[PROPERTY_VALUE_MAX] = {0};
+     property_get("ro.serialno", serial_prop, "");
+diff --git a/wlan.hpp b/wlan.hpp
+index 4ea8c5b..8fa7bcd 100644
+--- a/wlan.hpp
++++ b/wlan.hpp
+@@ -41,6 +41,27 @@ private:
+     static bool StartSupplicant();
+     static bool StopSupplicant();
+     static bool PrepareStableMacFirmware();
++
++    // Copies the chip's board data (bdwlan*, regdb*, WCNSS_qcom_cfg.ini) out of
++    // the mounted modem image into the ramdisk /vendor trees the driver probes.
++    // Recovery SELinux keeps the kernel firmware loader out of the vfat modem
++    // mount, and the tree's bundled copies use the Waffle-era chip directory
++    // name ("kiwi") while this device reports "kiwi_v2" — so both the payload
++    // and every directory spelling have to exist inside the ramdisk.
++    static bool StageDriverFirmware();
++
++    // Strongest BSSID advertising `ssid` in the current SCAN_RESULTS, or an
++    // empty string when the SSID is not visible to the driver at all.
++    static std::string FindBssidForSsid(const std::string& ssid);
++
++    // Blocks until the supplicant reports COMPLETED for `ssid`, polling STATUS
++    // between CTRL-EVENT-* waits. `tag` only labels the progress lines.
++    static bool WaitForAssociation(const std::string& ssid, int tries, const char* tag);
++
++    // Failure evidence: the scan rows for `ssid`, the per-network settings the
++    // supplicant actually stored, and the tail of the WLAN kernel messages.
++    static void DumpScanResultsForSsid(const std::string& ssid);
++    static void DumpDriverLog(const char* why);
+     static bool WaitForProperty(const std::string& key, const std::string& expected, int timeout_ms);
+     static bool WaitForSupplicantReady(int timeout_ms);
+     static bool StartInitSupplicantService();
+-- 
+2.55.0.windows.3
+

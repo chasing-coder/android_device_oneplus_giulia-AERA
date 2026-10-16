@@ -168,6 +168,10 @@ AERA_EXCLUDE_APEX                         := true
 AERA_EXCLUDE_DEFAULT_USB_INIT             := true
 AERA_DEFAULT_LANGUAGE                     := en
 AERA_EXTRA_LANGUAGES                      := true
+# Ask for the language once, before the first decryption prompt. The recovery
+# side is opt-in (patches/0003), so a build without this switch behaves exactly
+# as upstream. It only fires on devices whose build ships more than one language.
+AERA_FIRST_BOOT_LANGUAGE                  := true
 # Keep the ADSP loader in the early set: init uses its boot sysfs node while
 # preparing firmware. Load the actual SPF/machine/codec chain post-decrypt so
 # AudioPD can come online during SPF's probe window instead of after it expires.
