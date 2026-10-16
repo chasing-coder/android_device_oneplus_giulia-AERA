@@ -1,4 +1,4 @@
-From 3b0b0b26e24975dfe61fa7c505f347a3eb6d8f10 Mon Sep 17 00:00:00 2001
+From c76c95b878e5e2e7c6b5f7172d8d792b1feff41a Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 18:56:50 +0800
 Subject: [PATCH] wlan: stage the chip board data and report why an association
@@ -12,10 +12,19 @@ image, and the ramdisk ships the Waffle-era chip directory name "kiwi" while
 the device reports "kiwi_v2" - so the driver came up without its board data
 and every association attempt died without a single line of explanation.
 
-* StageDriverFirmware() copies the chip's board data out of the mounted
-  modem image (mounting it first when recovery has not) into every
-  directory spelling the driver probes, and relinks the stale ramdisk
-  copies at them. Called from Init() and Enable().
+The device's own board data is also per-unit: the modem image carries the
+segmented bdwlan.e01..bdwlan.e3d set for the eFuse revisions while the tree
+bundles only the generic bdwlan.b0c/bdwlan.elf copies. A driver that cannot
+find the calibration matching its eFuse quietly falls back to the generic
+image - enough to scan, not enough to associate.
+
+* StageDriverFirmware() copies the chip's board data out of the modem image
+  (mounting it first when boot has not) into the directory spellings the
+  driver probes, serving both "kiwi" and "kiwi_v2" and reading the payload
+  from /vendor/firmware_mnt/image and /firmware/image alike. Called from
+  Init() and Enable() so a late mount is still covered.
+* A stale real directory at an alias path is merged into the canonical store
+  before the symlink replaces it, so a bundled payload is never deleted.
 * Connect() scans first, pins the BSS the selected SSID is actually
   visible on, asks for PMF explicitly, and retries without the pin when
   the pinned attempt fails.
@@ -23,12 +32,12 @@ and every association attempt died without a single line of explanation.
   the SSID's SCAN_RESULTS rows plus the WLAN lines of the kernel ring
   buffer, so the next report carries the driver's own verdict.
 ---
- wlan.cpp | 486 ++++++++++++++++++++++++++++++++++++++++++++++++++++---
+ wlan.cpp | 543 ++++++++++++++++++++++++++++++++++++++++++++++++++++---
  wlan.hpp |  21 +++
- 2 files changed, 484 insertions(+), 23 deletions(-)
+ 2 files changed, 541 insertions(+), 23 deletions(-)
 
 diff --git a/wlan.cpp b/wlan.cpp
-index 5a8b125..e6de604 100644
+index 5a8b125..b63e749 100644
 --- a/wlan.cpp
 +++ b/wlan.cpp
 @@ -5,6 +5,7 @@
@@ -39,7 +48,7 @@ index 5a8b125..e6de604 100644
  #include <cstring>
  #include <dirent.h>
  #include <fstream>
-@@ -71,6 +72,22 @@ static constexpr int WLAN_SUPP_READY_TIMEOUT_MS = 60000;
+@@ -71,6 +72,29 @@ static constexpr int WLAN_SUPP_READY_TIMEOUT_MS = 60000;
   * wrapper (mondrian_wlan_up.sh); it is now native init builtins. */
  static const char* WLAN_SUPP_PREP_PROP = "sys.aera.wlan.up";
  
@@ -52,7 +61,14 @@ index 5a8b125..e6de604 100644
 + * the payload into the ramdisk before the driver asks for it. */
 +static const char* WLAN_MODEM_PARTITION     = "/dev/block/bootdevice/by-name/modem";
 +static const char* WLAN_FIRMWARE_IMAGE_ROOT = "/vendor/firmware_mnt/image";
++/* The init trigger mounts the modem image at /firmware and only links it to
++ * /vendor/firmware_mnt afterwards; staging may well run before that link. */
++static const char* WLAN_MODEM_MOUNT         = "/firmware";
 +static const char* WLAN_CHIP_FALLBACK       = "kiwi";
++/* The vendor tree loads qca_cld3_kiwi_v2, so the chip directory can be spelled
++ * either way. Serve both spellings instead of guessing which one the driver
++ * asks the firmware loader for. */
++static const char* WLAN_CHIP_ALIAS          = "kiwi_v2";
 +/* firmware_class resolves relative requests here, so both "<chip>/..." and
 + * "image/<chip>/..." spellings have to exist as well. */
 +static const char* WLAN_FIRMWARE_ROOT       = "/vendor/firmware";
@@ -62,7 +78,7 @@ index 5a8b125..e6de604 100644
  static int HexDigitValue(char value) {
      if (value >= '0' && value <= '9') return value - '0';
      if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-@@ -206,6 +223,11 @@ static bool OF_GetEncryptedSavedSsids(std::vector<std::string>& ssids)
+@@ -206,6 +230,11 @@ static bool OF_GetEncryptedSavedSsids(std::vector<std::string>& ssids)
  }
  
  bool Wlan::Init() {
@@ -74,7 +90,7 @@ index 5a8b125..e6de604 100644
      // Qualcomm selects the interface MAC while the WLAN module is loading.
      // Prepare its config and firmware file now, before post-decrypt modules
      // create wlan0. Runtime SIOCSIFHWADDR is rejected by newer QCA drivers.
-@@ -229,6 +251,11 @@ bool Wlan::Enable() {
+@@ -229,6 +258,11 @@ bool Wlan::Enable() {
      std::lock_guard<std::recursive_mutex> op(g_wlan_op_mutex);
      EnsureTmpLayout();
  
@@ -86,7 +102,7 @@ index 5a8b125..e6de604 100644
      if (!StartSupplicant()) {
          DataManager::SetValue("tw_wlan_enabled", 0);
          DataManager::SetValue("tw_wlan_connected", 0);
-@@ -330,6 +357,165 @@ bool Wlan::Scan() {
+@@ -330,6 +364,165 @@ bool Wlan::Scan() {
      return false;
  }
  
@@ -252,7 +268,7 @@ index 5a8b125..e6de604 100644
  bool Wlan::Connect() {
      std::lock_guard<std::recursive_mutex> op(g_wlan_op_mutex);
      DataManager::SetValue("wlan_connect_text", "Connecting");
-@@ -387,6 +573,24 @@ bool Wlan::Connect() {
+@@ -387,6 +580,24 @@ bool Wlan::Connect() {
      gui_print("Encryption: %s (key_mgmt: %s)\n", enc.c_str(), key_mgmt.c_str());
      gui_print(" \n");
  
@@ -277,7 +293,7 @@ index 5a8b125..e6de604 100644
      gui_print("Remove old network config...\n");
      std::string list_out;
      if (SuppCmd("LIST_NETWORKS", list_out)) {
-@@ -518,6 +722,25 @@ bool Wlan::Connect() {
+@@ -518,6 +729,25 @@ bool Wlan::Connect() {
          }
      }
  
@@ -303,7 +319,7 @@ index 5a8b125..e6de604 100644
      gui_print("Enable new config for network...\n");
      if (!SuppCmd("ENABLE_NETWORK " + network_id)) {
          gui_print("WLAN: enable_network failed\n");
-@@ -551,33 +774,23 @@ bool Wlan::Connect() {
+@@ -551,33 +781,23 @@ bool Wlan::Connect() {
  
      // Wait for association via supplicant events instead of polling STATUS on a
      // fixed 1s cadence: each iteration blocks up to 1.5s for a relevant event,
@@ -350,7 +366,7 @@ index 5a8b125..e6de604 100644
      }
  
      if (!completed) {
-@@ -596,6 +809,27 @@ bool Wlan::Connect() {
+@@ -596,6 +816,27 @@ bool Wlan::Connect() {
          if (SuppCmd("LIST_NETWORKS", failure_networks))
              gui_print("WLAN: LIST_NETWORKS after failure:\n%s\n",
                        failure_networks.c_str());
@@ -378,7 +394,7 @@ index 5a8b125..e6de604 100644
          DataManager::SetValue("wlan_connect_text", "Failed");
          DataManager::SetValue("wlan_connect_done", 0);
          DataManager::SetValue("tw_wlan_connected", 0);
-@@ -1285,6 +1519,212 @@ bool Wlan::StartSupplicant() {
+@@ -1285,6 +1526,262 @@ bool Wlan::StartSupplicant() {
      return StartInitSupplicantService();
  }
  
@@ -392,7 +408,21 @@ index 5a8b125..e6de604 100644
 +        return true;
 +    if (name == "WCNSS_qcom_cfg.ini")
 +        return true;
++    /* Deterministic MAC written by PrepareStableMacFirmware(). */
++    if (name == "wlan_mac.bin")
++        return true;
 +    return false;
++}
++
++// Comma-separated list for the log lines; the set stays small.
++std::string JoinNames(const std::set<std::string>& names) {
++    std::string joined;
++    for (std::set<std::string>::const_iterator it = names.begin(); it != names.end(); ++it) {
++        if (!joined.empty())
++            joined += ",";
++        joined += *it;
++    }
++    return joined;
 +}
 +
 +// Collects one directory level of `root` into `names`. Missing roots are fine.
@@ -421,6 +451,12 @@ index 5a8b125..e6de604 100644
 + * in this device tree use the Waffle-era directory name "kiwi" while the device
 + * itself reports "kiwi_v2". The payload is copied exactly once and every other
 + * spelling is a symlink to it, so the ramdisk grows by a single copy.
++ *
++ * The device's own board data is also per-unit: the modem image carries the
++ * segmented bdwlan.e01..bdwlan.e3d set for the eFuse revisions, while the tree
++ * only bundles the generic bdwlan.b0c/bdwlan.elf copies. A driver that cannot
++ * find the calibration matching its eFuse quietly falls back to the generic
++ * image, which is enough to scan but not enough to associate.
 + */
 +bool Wlan::StageDriverFirmware() {
 +    // The vendor fstab mount lives on the modem partition; bring it up if the
@@ -429,12 +465,14 @@ index 5a8b125..e6de604 100644
 +    if (!FileExists(WLAN_FIRMWARE_IMAGE_ROOT) && FileExists(WLAN_MODEM_PARTITION)) {
 +        char slot[PROPERTY_VALUE_MAX] = {0};
 +        property_get("ro.boot.slot_suffix", slot, "");
-+        RunCommand(std::string("mkdir -p /firmware && mount vfat ") + WLAN_MODEM_PARTITION +
-+                   slot + " /firmware ro");
++        if (RunCommand(std::string("mkdir -p ") + WLAN_MODEM_MOUNT + " && mount vfat " +
++                       WLAN_MODEM_PARTITION + slot + " " + WLAN_MODEM_MOUNT + " ro"))
++            LOGINFO("WLAN: mounted the modem image at %s\n", WLAN_MODEM_MOUNT);
 +    }
 +
 +    const std::vector<std::string> source_roots = {
 +        WLAN_FIRMWARE_IMAGE_ROOT,
++        std::string(WLAN_MODEM_MOUNT) + "/image",
 +        "/odm/etc/wifi",
 +        "/vendor/odm/etc/wifi",
 +        "/vendor/etc/wifi",
@@ -446,6 +484,7 @@ index 5a8b125..e6de604 100644
 +    // fallback spelling the bundled copies use.
 +    std::set<std::string> chips;
 +    chips.insert(WLAN_CHIP_FALLBACK);
++    chips.insert(WLAN_CHIP_ALIAS);
 +
 +    DIR* modules = opendir("/sys/module");
 +    if (modules) {
@@ -494,8 +533,8 @@ index 5a8b125..e6de604 100644
 +    }
 +
 +    if (chosen.empty()) {
-+        LOGERR("WLAN: no board data found under %s (chip names tried: %s)\n",
-+               WLAN_FIRMWARE_IMAGE_ROOT, WLAN_CHIP_FALLBACK);
++        LOGERR("WLAN: no board data found (chip names tried: %s, looked under %s and the odm/ramdisk copies)\n",
++               JoinNames(chips).c_str(), WLAN_FIRMWARE_IMAGE_ROOT);
 +        return false;
 +    }
 +
@@ -543,10 +582,36 @@ index 5a8b125..e6de604 100644
 +        "/vendor/odm/firmware",
 +    };
 +
++    // A real directory at an alias path (the bundled copies use the old chip
++    // name) must be merged into the store before the link replaces it: deleting
++    // it outright would throw away board data this run did not pick up.
++    const auto MergeIntoStore = [](const std::string& from, const std::string& to) {
++        DIR* dh = opendir(from.c_str());
++        if (!dh)
++            return;
++
++        while (struct dirent* entry = readdir(dh)) {
++            const std::string name = entry->d_name;
++            if (name.empty() || name[0] == '.')
++                continue;
++
++            const std::string dst = to + "/" + name;
++            if (FileExists(dst))
++                continue;
++
++            std::string payload;
++            if (!ReadFile(from + "/" + name, payload))
++                continue;
++            if (WriteFile(dst, payload))
++                gui_print("WLAN: kept bundled board data %s\n", name.c_str());
++        }
++        closedir(dh);
++    };
++
 +    // Points `link` at `target`, replacing whatever is there: a real directory
 +    // (the bundled Waffle copies use the old chip name) would otherwise swallow
 +    // the link and create it one level too deep.
-+    const auto Relink = [](const std::string& target, const std::string& link) {
++    const auto Relink = [&MergeIntoStore](const std::string& target, const std::string& link) {
 +        char resolved[4096] = {0};
 +        const ssize_t got = readlink(link.c_str(), resolved, sizeof(resolved) - 1);
 +        if (got > 0 && std::string(resolved, static_cast<size_t>(got)) == target)
@@ -561,6 +626,7 @@ index 5a8b125..e6de604 100644
 +            return;
 +        }
 +
++        MergeIntoStore(link, target);
 +        Wlan::RunCommand("rm -rf " + link);
 +        if (symlink(target.c_str(), link.c_str()) != 0)
 +            LOGERR("WLAN: cannot link %s -> %s: %s\n", link.c_str(), target.c_str(),
@@ -582,9 +648,9 @@ index 5a8b125..e6de604 100644
 +         it != chosen.end(); ++it)
 +        Relink(store + "/" + it->first, std::string(WLAN_FIRMWARE_ROOT) + "/" + it->first);
 +
-+    gui_print("WLAN: staged %zu board-data file(s) (%zu bytes) into %s for %zu chip name(s)%s\n",
-+              staged_files, staged_bytes, store.c_str(), chips.size(),
-+              capped ? ", payload capped" : "");
++    gui_print("WLAN: staged %zu board-data file(s) (%zu bytes) into %s; chip names: %s%s\n",
++              staged_files, staged_bytes, store.c_str(), JoinNames(chips).c_str(),
++              capped ? " (payload capped)" : "");
 +    return true;
 +}
 +
