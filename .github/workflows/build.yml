@@ -193,22 +193,35 @@ jobs:
       run: |
         set -euo pipefail
         shopt -s nullglob
-        PATCH_DIR="$PWD/device/${{ github.event.inputs.DEVICE_PATH }}/patches"
-        patches=("$PATCH_DIR"/*.patch)
-        if [ ${#patches[@]} -eq 0 ]; then
-          echo "::error::no patches found in $PATCH_DIR - refusing to build an unpatched recovery"
+        PATCH_ROOT="$PWD/device/${{ github.event.inputs.DEVICE_PATH }}/patches"
+        # Patches are grouped by the project they patch:
+        #   patches/bootable/recovery/*.patch -> applied in bootable/recovery
+        #   patches/vendor/recovery/*.patch   -> applied in vendor/recovery
+        applied=0
+        for patch in "$PATCH_ROOT"/*/*/*.patch; do
+          rel="${patch#"$PATCH_ROOT"/}"
+          target="${rel%/*.patch}"
+          if [ ! -d "$target" ]; then
+            echo "::error::$rel targets a directory that was not synced: $target"
+            exit 1
+          fi
+          # 'repo sync' keeps each project's git dir inside .repo, and the Sync
+          # source step deletes .repo, so the projects are bare work trees by
+          # now. Plain 'git apply' needs no repository; drop the dangling .git
+          # so git does not try to treat the directory as one.
+          [ -d "$target/.git" ] || rm -f "$target/.git"
+          echo "==> $rel"
+          ( cd "$target" && git apply --stat "$patch" && git apply "$patch" ) || {
+            echo "::error::failed to apply $rel"
+            exit 1
+          }
+          applied=$((applied + 1))
+        done
+        if [ "$applied" -eq 0 ]; then
+          echo "::error::no patches found under $PATCH_ROOT - refusing to build an unpatched recovery"
           exit 1
         fi
-        # 'repo sync' keeps each project's git dir inside .repo, and the Sync
-        # source step deletes .repo, so bootable/recovery is a bare work tree by
-        # now. Plain 'git apply' needs no repository; drop the dangling .git so
-        # git does not try to treat the directory as one.
-        [ -d bootable/recovery/.git ] || rm -f bootable/recovery/.git
-        for patch in "${patches[@]}"; do
-          echo "Applying $(basename "$patch")"
-          ( cd bootable/recovery && git apply --stat "$patch" && git apply "$patch" )
-        done
-        echo "Applied ${#patches[@]} patch(es) to bootable/recovery."
+        echo "Applied $applied patch(es)."
 
     - name: Generate build info
       run: |
