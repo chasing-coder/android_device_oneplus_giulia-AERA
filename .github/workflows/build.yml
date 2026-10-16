@@ -189,6 +189,27 @@ jobs:
       run: |
         git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} device/${{ github.event.inputs.DEVICE_PATH }}
 
+    - name: Apply device patches
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        PATCH_DIR="$PWD/device/${{ github.event.inputs.DEVICE_PATH }}/patches"
+        patches=("$PATCH_DIR"/*.patch)
+        if [ ${#patches[@]} -eq 0 ]; then
+          echo "::error::no patches found in $PATCH_DIR - refusing to build an unpatched recovery"
+          exit 1
+        fi
+        # 'repo sync' keeps each project's git dir inside .repo, and the Sync
+        # source step deletes .repo, so bootable/recovery is a bare work tree by
+        # now. Plain 'git apply' needs no repository; drop the dangling .git so
+        # git does not try to treat the directory as one.
+        [ -d bootable/recovery/.git ] || rm -f bootable/recovery/.git
+        for patch in "${patches[@]}"; do
+          echo "Applying $(basename "$patch")"
+          ( cd bootable/recovery && git apply --stat "$patch" && git apply "$patch" )
+        done
+        echo "Applied ${#patches[@]} patch(es) to bootable/recovery."
+
     - name: Generate build info
       run: |
         echo -e "$BUILD_INFO" >> INFO.txt

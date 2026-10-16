@@ -1,0 +1,120 @@
+From 171dba510c302e47ee1b353dfcc4f95c335db913 Mon Sep 17 00:00:00 2001
+From: cheng343 <203324649+cheng343@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 12:46:52 +0800
+Subject: [PATCH 2/3] aeraui: credit the maintainer on the boot canvas
+
+The first screen carried no text at all: the boot scene is nine prefiltered A8
+image layers plus a precomposed brand mark. Add the maintainer credit under the
+subtitle as a label instead of another baked asset, so the string stays
+editable, and route it through UiFont() so the CJK glyphs come from the language
+fallback chain rather than the Latin-only Montserrat face.
+
+The label rides ScaleOffset() on the same 1353 reference canvas as the image
+assets, so it keeps its slot below the subtitle on every screen width, fades in
+just after the subtitle (3080ms, 260ms) and leaves with the brand mark during
+the outro. DeleteBoot removes it together with the other top-layer objects.
+---
+ aeraui/scenes/boot_scene.cpp | 48 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/aeraui/scenes/boot_scene.cpp b/aeraui/scenes/boot_scene.cpp
+index 3ca68e3..1d02679 100644
+--- a/aeraui/scenes/boot_scene.cpp
++++ b/aeraui/scenes/boot_scene.cpp
+@@ -32,6 +32,12 @@ constexpr int32_t kFinalX = 254;
+ constexpr int32_t kFinalY = 256;
+ constexpr int32_t kFinalWidth = 846;
+ constexpr int32_t kFinalHeight = 791;
++// Maintainer credit, laid out in the same 1353 canvas as the image assets so
++// it tracks the boot canvas scaling. It sits just below the subtitle, which
++// occupies y 997..1047 in reference space.
++constexpr int32_t kCreditY = 1112;
++constexpr int32_t kCreditHeight = 44;
++constexpr const char *kCreditText = "by酷安：沉醉于星河";
+ 
+ enum AssetIndex {
+   kMidLeft,
+@@ -102,6 +108,7 @@ struct BootContext {
+   lv_obj_t *objects[kAssetCount];
+   lv_obj_t *final_white;
+   lv_obj_t *final_cyan;
++  lv_obj_t *credit;
+   lv_image_dsc_t arrow_descriptor;
+   uint8_t *arrow_pixels;
+   uint8_t *arrow_order;
+@@ -120,6 +127,13 @@ void SetImageOpacity(void *object, int32_t value) {
+   lv_obj_set_style_image_opa(static_cast<lv_obj_t *>(object), value, 0);
+ }
+ 
++// Labels carry their own opacity property, so the credit line needs its own
++// animation callback next to the image one.
++void SetTextOpacity(void *object, int32_t value) {
++  lv_obj_set_style_text_opa(static_cast<lv_obj_t *>(object),
++                            static_cast<lv_opa_t>(value), 0);
++}
++
+ void SetObjectX(void *object, int32_t value) {
+   lv_obj_set_x(static_cast<lv_obj_t *>(object), value);
+ }
+@@ -360,6 +374,14 @@ void StartOutro(BootContext *boot) {
+     lv_anim_set_exec_cb(&fade, SetImageOpacity);
+     lv_anim_start(&fade);
+   }
++
++  // The credit leaves together with the brand mark: the outro hands the panel
++  // over to the next scene, so nothing may stay behind on the top layer.
++  if (boot->credit != nullptr) {
++    lv_anim_delete(boot->credit, SetTextOpacity);
++    AnimateValue(boot->credit, SetTextOpacity, LV_OPA_COVER, LV_OPA_TRANSP, 610,
++                 150, lv_anim_path_ease_in);
++  }
+ }
+ 
+ void DeleteBoot(lv_event_t *event) {
+@@ -382,6 +404,10 @@ void DeleteBoot(lv_event_t *event) {
+     lv_anim_delete(image, SetImageOpacity);
+     if (lv_obj_is_valid(image)) lv_obj_delete(image);
+   }
++  if (boot->credit != nullptr) {
++    lv_anim_delete(boot->credit, SetTextOpacity);
++    if (lv_obj_is_valid(boot->credit)) lv_obj_delete(boot->credit);
++  }
+   lv_image_cache_drop(&boot->arrow_descriptor);
+   if (boot->arrow_pixels != nullptr) lv_free(boot->arrow_pixels);
+   if (boot->arrow_order != nullptr) lv_free(boot->arrow_order);
+@@ -469,6 +495,24 @@ void BuildBootScene(lv_obj_t *screen, ActionCallback callback, void *context) {
+     lv_obj_add_flag(image, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
+   }
+ 
++  /*
++   * Maintainer credit under the wordmark. A label instead of an A8 asset keeps
++   * the text editable, and going through UiFont() pulls the CJK glyphs from the
++   * language fallback chain rather than the Latin-only Montserrat face. It rides
++   * the same scaled offsets as the images via ScaleOffset(), so it lands in the
++   * reference-space slot below the subtitle on every screen size.
++   */
++  boot->credit = lv_label_create(lv_layer_top());
++  lv_label_set_text(boot->credit, kCreditText);
++  const lv_font_t *credit_font = UiFont(&lv_font_montserrat_28);
++  lv_obj_set_style_text_font(
++      boot->credit, credit_font != nullptr ? credit_font : &lv_font_montserrat_28,
++      0);
++  lv_obj_set_style_text_color(boot->credit, lv_color_hex(0xc9d2d8), 0);
++  lv_obj_set_style_text_opa(boot->credit, LV_OPA_TRANSP, 0);
++  lv_obj_align(boot->credit, LV_ALIGN_CENTER, 0,
++               ScaleOffset(kCreditY, kCreditHeight, boot->base_scale));
++
+   // Approved route: lower-left, up to the crown, all the way down the right,
+   // and only then the isolated internal triangle.
+   AnimatePiece(boot, kBottomLeft, -200, 212, 0, 620);
+@@ -487,6 +531,10 @@ void BuildBootScene(lv_obj_t *screen, ActionCallback callback, void *context) {
+                lv_anim_path_ease_out);
+   AnimateValue(boot, SetSubtitleProgress, 0, LV_OPA_COVER, 2940, 220,
+                lv_anim_path_ease_out);
++  // The credit follows the subtitle in, slightly later so the two lines do not
++  // appear as one block.
++  AnimateValue(boot->credit, SetTextOpacity, LV_OPA_TRANSP, LV_OPA_COVER, 3080,
++               260, lv_anim_path_ease_out);
+ 
+   lv_obj_set_style_image_opa(boot->objects[kArrow], LV_OPA_COVER, 0);
+   AnimateValue(boot, SetArrowProgress, 0, 255, 3250, 1100,

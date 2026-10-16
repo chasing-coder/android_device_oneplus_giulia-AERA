@@ -1,0 +1,421 @@
+From 6460c454c6d3f67e1b13f189f8976ec1b0b50bd8 Mon Sep 17 00:00:00 2001
+From: cheng343 <203324649+cheng343@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 13:36:40 +0800
+Subject: [PATCH 3/3] aeraui: prompt for language before decryption on first
+ boot (opt-in)
+
+Shown only when AERA_FIRST_BOOT_LANGUAGE is enabled and the build ships more than one language. BeginDecryption() now builds the credential page through a shared ShowDecryptScene() helper and offers the chooser before it; choosing a language or skipping both record the decision and continue, so decryption is never blocked.
+---
+ aeraui/Android.bp                           |  1 +
+ aeraui/build/aeraui_defaults.go             |  6 ++
+ aeraui/core/engine.cpp                      | 50 ++++++++++-
+ aeraui/include/aeraui/backend.hpp           |  4 +
+ aeraui/include/aeraui/engine.hpp            |  2 +
+ aeraui/platform/aera_backend.cpp            | 45 +++++++++-
+ aeraui/scenes/first_boot_language_scene.cpp | 95 +++++++++++++++++++++
+ aeraui/scenes/scene.hpp                     |  5 ++
+ 8 files changed, 205 insertions(+), 3 deletions(-)
+ create mode 100644 aeraui/scenes/first_boot_language_scene.cpp
+
+diff --git a/aeraui/Android.bp b/aeraui/Android.bp
+index 6a23b1b..ebbc2a1 100644
+--- a/aeraui/Android.bp
++++ b/aeraui/Android.bp
+@@ -102,6 +102,7 @@ cc_library_static {
+         "scenes/decrypt_scene.cpp",
+         "scenes/doom_scene.cpp",
+         "scenes/fastboot_scene.cpp",
++        "scenes/first_boot_language_scene.cpp",
+         "scenes/gallery_scene.cpp",
+         "scenes/generic_plugin_scene.cpp",
+         "scenes/home_scene.cpp",
+diff --git a/aeraui/build/aeraui_defaults.go b/aeraui/build/aeraui_defaults.go
+index 9660a02..ce4571f 100644
+--- a/aeraui/build/aeraui_defaults.go
++++ b/aeraui/build/aeraui_defaults.go
+@@ -80,6 +80,12 @@ func aeraUiLanguageFlags(ctx android.BaseContext) []string {
+ 	if getMakeVars(ctx, "AERA_EXTRA_LANGUAGES") == "true" {
+ 		cflags = append(cflags, "-DAERA_EXTRA_LANGUAGES=1")
+ 	}
++	// Opt-in pre-decryption language prompt. Off unless the device tree asks for
++	// it, so a build without the switch keeps today's behaviour.
++	firstBootLanguage := strings.Trim(getMakeVars(ctx, "AERA_FIRST_BOOT_LANGUAGE"), "\"")
++	if firstBootLanguage == "1" || strings.EqualFold(firstBootLanguage, "true") {
++		cflags = append(cflags, "-DAERA_FIRST_BOOT_LANGUAGE=1")
++	}
+ 	return cflags
+ }
+ 
+diff --git a/aeraui/core/engine.cpp b/aeraui/core/engine.cpp
+index e7ec22f..961bba0 100644
+--- a/aeraui/core/engine.cpp
++++ b/aeraui/core/engine.cpp
+@@ -735,6 +735,8 @@ public:
+                        int pattern_grid_size) {
+     if (interactive_ready_ || backend_ready_) return;
+     interactive_ready_ = true;
++    // Set before the optional language prompt so it inherits the decrypt page's
++    // protections (Back stays off the home screen while either one is up).
+     decryption_active_ = true;
+     secondary_decryption_ = false;
+     credential_type_ = credential_type;
+@@ -745,14 +747,44 @@ public:
+     ApplyStoredAppearance();
+     lv_obj_t *boot_screen = lv_screen_active();
+     CompleteBootScene(boot_screen);
++#ifdef AERA_FIRST_BOOT_LANGUAGE
++    if (OfferFirstBootLanguage(file_based, pattern_grid_size)) return;
++#endif
++    ShowDecryptScene(file_based, pattern_grid_size);
++  }
++
++  // Builds the credential page. The opt-in first-boot language prompt is shown
++  // before this runs, so both paths share one construction.
++  void ShowDecryptScene(bool file_based, int pattern_grid_size) {
+     lv_obj_t *decrypt = lv_obj_create(nullptr);
+     decrypt_scene_ = BuildDecryptScene(
+-        decrypt, credential_type, file_based, user_id, pattern_grid_size,
+-        HandleSceneAction, this);
++        decrypt, credential_type_, file_based, crypto_user_id_,
++        pattern_grid_size, HandleSceneAction, this);
+     on_home_ = false;
+     lv_screen_load_anim(decrypt, LV_SCR_LOAD_ANIM_FADE_IN, 820, 0, true);
+   }
+ 
++#ifdef AERA_FIRST_BOOT_LANGUAGE
++  // Returns true when the language prompt took over the screen. Every other
++  // outcome - a single-language build, a recorded choice, or no screen - returns
++  // false and decryption proceeds exactly as it does today.
++  bool OfferFirstBootLanguage(bool file_based, int pattern_grid_size) {
++    if (i18n::AvailableLanguages().size() < 2) return false;
++    if (RecoveryLanguageChosen()) return false;
++    lv_obj_t *language = lv_obj_create(nullptr);
++    if (language == nullptr) return false;
++    pending_file_based_ = file_based;
++    pending_pattern_grid_size_ = pattern_grid_size;
++    BuildFirstBootLanguageScene(language, HandleSceneAction, this);
++    lv_screen_load_anim(language, LV_SCR_LOAD_ANIM_FADE_IN, 820, 0, true);
++    return true;
++  }
++
++  void ContinueAfterFirstBootLanguage() {
++    ShowDecryptScene(pending_file_based_, pending_pattern_grid_size_);
++  }
++#endif
++
+   void SetBackendReady() {
+     if (backend_ready_)
+       return;
+@@ -2383,6 +2415,15 @@ private:
+       return;
+     }
+ 
++#ifdef AERA_FIRST_BOOT_LANGUAGE
++    // Dispatched before the decryption gate below: the prompt runs while
++    // decryption_active_ is set but no decrypt scene exists yet.
++    if (action == Action::kFirstBootLanguageDone) {
++      self->ContinueAfterFirstBootLanguage();
++      return;
++    }
++#endif
++
+     if (self->decryption_active_) {
+       if (action == Action::kDecryptSubmit) {
+         self->StartDecryption();
+@@ -3836,6 +3877,11 @@ private:
+   bool operation_visible_ = true;
+   int credential_type_ = 0;
+   int crypto_user_id_ = 0;
++#ifdef AERA_FIRST_BOOT_LANGUAGE
++  // Decrypt-page arguments held while the first-boot language prompt is up.
++  bool pending_file_based_ = false;
++  int pending_pattern_grid_size_ = 0;
++#endif
+   bool decrypt_running_ = false;
+   bool wifi_running_ = false;
+   bool wifi_scene_report_ = false;
+diff --git a/aeraui/include/aeraui/backend.hpp b/aeraui/include/aeraui/backend.hpp
+index 024f817..b9d6171 100644
+--- a/aeraui/include/aeraui/backend.hpp
++++ b/aeraui/include/aeraui/backend.hpp
+@@ -260,6 +260,10 @@ bool RecoveryDockHideInApps();
+ bool RecoverySetDockHideInApps(bool enabled);
+ std::string RecoveryLanguage();
+ bool RecoverySetLanguage(const std::string &language);
++// First-boot language prompt bookkeeping. The record lives in the early UI
++// cache because it is written before decryption, while /data is unavailable.
++bool RecoveryLanguageChosen();
++bool RecoveryMarkLanguageChosen();
+ enum class BrowserCookiePolicy {
+   kBlockAll = 0,
+   kFirstParty = 1,
+diff --git a/aeraui/include/aeraui/engine.hpp b/aeraui/include/aeraui/engine.hpp
+index 95dcb2f..5fc58c2 100644
+--- a/aeraui/include/aeraui/engine.hpp
++++ b/aeraui/include/aeraui/engine.hpp
+@@ -75,6 +75,8 @@ enum class Action {
+     kCancelPcBackup,
+     kStatusBar,
+     kTemperatures,
++    // Pre-decryption language prompt: the user picked a language or skipped it.
++    kFirstBootLanguageDone,
+ };
+ 
+ enum class DecryptionCompletion {
+diff --git a/aeraui/platform/aera_backend.cpp b/aeraui/platform/aera_backend.cpp
+index 9f23186..65bbc3e 100644
+--- a/aeraui/platform/aera_backend.cpp
++++ b/aeraui/platform/aera_backend.cpp
+@@ -115,6 +115,7 @@ namespace aeraui {
+ namespace {
+ void LoadAeraPreferencesIfAvailable();
+ bool SaveAeraPreferences(bool require_early = false);
++bool SaveEarlyUiPreferences();
+ bool ResetAeraSettings(bool theme);
+ int DefaultHapticDuration(Haptic haptic);
+ std::atomic<bool> gSideloadActive{false};
+@@ -124,6 +125,10 @@ std::atomic<uint64_t> gSideloadTotalBytes{0};
+ bool gLiveFastbootPostDecryptReady = false;
+ constexpr const char *kFastbootWifiPreference = "aera_fastboot_wifi";
+ constexpr const char *kFastbootProtocolProperty = "fastbootd.protocol";
++// Recorded once the pre-decryption language prompt has been answered or skipped.
++// It lives in the early UI cache because the prompt runs while /data is still
++// encrypted and preferences.conf cannot be written yet.
++constexpr const char *kLanguageChosenPreference = "aera_language_chosen";
+ 
+ bool FastbootWifiPrerequisites() {
+ #ifdef OF_ENABLE_WLAN
+@@ -2009,6 +2014,23 @@ bool RecoverySetLanguage(const std::string &language) {
+   }
+   return DataManager::SetValue("tw_language", language, 1) == 0;
+ }
++bool RecoveryLanguageChosen() {
++  LoadAeraPreferencesIfAvailable();
++  return DataManager::GetIntValue(kLanguageChosenPreference) != 0;
++}
++bool RecoveryMarkLanguageChosen() {
++  const int previous = DataManager::GetIntValue(kLanguageChosenPreference);
++  if (DataManager::SetValue(kLanguageChosenPreference, 1, 1) != 0) return false;
++  // This runs while /data is still locked, so SaveAeraPreferences() would return
++  // before reaching its own early-cache write: refresh the cache directly.
++  const bool early_saved = SaveEarlyUiPreferences();
++  // No-op before decryption and the normal refresh afterwards, once /data is
++  // available, so the full preferences file also carries the record.
++  SaveAeraPreferences();
++  if (early_saved) return true;
++  DataManager::SetValue(kLanguageChosenPreference, previous, 1);
++  return false;
++}
+ std::string RecoveryBrowserHomepage() {
+   LoadAeraPreferencesIfAvailable();
+   const std::string value = DataManager::GetStrValue("aera_browser_homepage");
+@@ -2139,6 +2161,7 @@ struct EarlyUiPreferences {
+   int themed_home_icons;
+   int interface_size;
+   std::string language;
++  int language_chosen;
+   std::string keyboard_layout;
+   int home_grid_columns;
+   int dock_layout;
+@@ -2213,6 +2236,7 @@ EarlyUiPreferences DefaultEarlyUiPreferences() {
+   preferences.themed_home_icons = 0;
+   preferences.interface_size = 1;
+   preferences.language = AERA_DEFAULT_LANGUAGE;
++  preferences.language_chosen = 0;
+   preferences.keyboard_layout = "qwerty";
+   preferences.home_grid_columns = 3;
+   preferences.dock_layout = 0;
+@@ -2273,6 +2297,8 @@ EarlyUiPreferences CaptureCurrentEarlyUiPreferences() {
+       interface_size.empty() ? 1 : std::clamp(atoi(interface_size.c_str()), 0, 3);
+   preferences.language = DataManager::GetStrValue("tw_language");
+   if (!ValidLanguage(preferences.language)) preferences.language = AERA_DEFAULT_LANGUAGE;
++  preferences.language_chosen =
++      DataManager::GetIntValue(kLanguageChosenPreference) != 0 ? 1 : 0;
+   preferences.keyboard_layout =
+       DataManager::GetStrValue("aera_keyboard_layout") == "qwertz" ? "qwertz" : "qwerty";
+   const int home_grid_columns =
+@@ -2437,6 +2463,9 @@ bool SetEarlyUiValue(EarlyUiPreferences* preferences, const std::string& key,
+   } else if (key == "language") {
+     if (!ValidLanguage(value)) return false;
+     preferences->language = value;
++  } else if (key == "language_chosen") {
++    if (!ParseInteger(value, 0, 1, &parsed)) return false;
++    preferences->language_chosen = parsed;
+   } else if (key == "keyboard_layout") {
+     if (value != "qwerty" && value != "qwertz") return false;
+     preferences->keyboard_layout = value;
+@@ -2561,6 +2590,7 @@ void ApplyEarlyUiPreferences(const EarlyUiPreferences& preferences) {
+   DataManager::SetValue("aera_themed_home_icons", preferences.themed_home_icons);
+   DataManager::SetValue("aera_interface_size", preferences.interface_size);
+   DataManager::SetValue("tw_language", preferences.language);
++  DataManager::SetValue(kLanguageChosenPreference, preferences.language_chosen);
+   DataManager::SetValue("aera_keyboard_layout", preferences.keyboard_layout);
+   DataManager::SetValue("aera_home_grid_columns", preferences.home_grid_columns);
+   DataManager::SetValue("aera_dock_layout", preferences.dock_layout);
+@@ -2654,6 +2684,7 @@ std::string SerializeEarlyUiPreferences(const EarlyUiPreferences& preferences) {
+          << "themed_home_icons=" << preferences.themed_home_icons << '\n'
+          << "interface_size=" << preferences.interface_size << '\n'
+          << "language=" << preferences.language << '\n'
++         << "language_chosen=" << preferences.language_chosen << '\n'
+          << "keyboard_layout=" << preferences.keyboard_layout << '\n'
+          << "home_grid_columns=" << preferences.home_grid_columns << '\n'
+          << "dock_layout=" << preferences.dock_layout << '\n'
+@@ -2770,6 +2801,9 @@ void LoadAeraPreferencesIfAvailable() {
+   if (!input) return;
+ 
+   EarlyUiPreferences full_ui = gEarlyDefaults;
++  // The language prompt is answered before decryption, so this file may predate
++  // its key. Keep the value the early cache restored instead of resetting it.
++  bool saw_language_chosen = false;
+   std::string line;
+   while (std::getline(input, line)) {
+     if (!line.empty() && line.back() == '\r') line.pop_back();
+@@ -2779,7 +2813,10 @@ void LoadAeraPreferencesIfAvailable() {
+     const std::string value = line.substr(separator + 1);
+     bool early_key = false;
+     SetEarlyUiValue(&full_ui, key, value, &early_key);
+-    if (early_key) continue;
++    if (early_key) {
++      if (key == "language_chosen") saw_language_chosen = true;
++      continue;
++    }
+     if (key == "hidden")
+       DataManager::SetValue("tw_hidden_files", value);
+     else if (key == "compression") DataManager::SetValue(TW_USE_COMPRESSION_VAR, value);
+@@ -2804,6 +2841,9 @@ void LoadAeraPreferencesIfAvailable() {
+     else if (key == "wifi_auto_connect") DataManager::SetValue("of_wlan_auto_connect", value);
+     else if (key == "wifi_last_ssid") DataManager::SetValue("of_wlan_last_ssid", value);
+   }
++  if (!saw_language_chosen)
++    full_ui.language_chosen =
++        DataManager::GetIntValue(kLanguageChosenPreference) != 0 ? 1 : 0;
+   ApplyEarlyUiPreferences(full_ui);
+   loaded = true;
+   ApplyEarlyUiSideEffects();
+@@ -2850,6 +2890,9 @@ bool SaveAeraPreferences(bool require_early) {
+          << "dock_blur=" << RecoveryDockBlur() << '\n'
+          << "dock_hide_apps=" << (RecoveryDockHideInApps() ? 1 : 0) << '\n'
+          << "language=" << RecoveryLanguage() << '\n'
++         << "language_chosen="
++         << (DataManager::GetIntValue(kLanguageChosenPreference) != 0 ? 1 : 0)
++         << '\n'
+          << "ui_font=" << RecoveryUiFont() << '\n'
+          << "wallpaper=" << RecoveryWallpaperPath() << '\n'
+          << "browser_homepage=" << RecoveryBrowserHomepage() << '\n'
+diff --git a/aeraui/scenes/first_boot_language_scene.cpp b/aeraui/scenes/first_boot_language_scene.cpp
+new file mode 100644
+index 0000000..e8e327b
+--- /dev/null
++++ b/aeraui/scenes/first_boot_language_scene.cpp
+@@ -0,0 +1,95 @@
++/*
++ * Copyright (C) 2026 AERA Recovery Project contributors
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include "scene.hpp"
++#include "ui_components.hpp"
++
++#include <algorithm>
++#include <string>
++
++#include <lvgl.h>
++
++#include "design.hpp"
++#include "aeraui/i18n.hpp"
++
++namespace aeraui {
++namespace {
++using namespace widgets;
++using namespace design;
++
++// The prompt runs before decryption, so it owns no navigation and no
++// status-bar shade: choosing a language, or skipping, is the only way forward.
++void ContinueToDecryption(ActionCallback callback, void *context) {
++  if (callback != nullptr) callback(Action::kFirstBootLanguageDone, context);
++}
++
++}  // namespace
++
++void BuildFirstBootLanguageScene(lv_obj_t *screen, ActionCallback callback,
++                                 void *context) {
++  // Static bilingual copy on purpose: the chooser cannot depend on a catalog
++  // entry, because the catalog is what the user is about to select.
++  Header(screen, "Language / 语言", "Choose a language / 选择语言", nullptr,
++         nullptr);
++  const bool landscape = Landscape(screen);
++  const int top = landscape ? 340 : 452;
++  // Room for the skip button below the list.
++  const int footer = 176;
++  lv_obj_t *list = Scroll(
++      screen, top,
++      std::max(1, static_cast<int>(lv_obj_get_height(screen)) - top - footer));
++  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_ON);
++  lv_obj_set_style_width(list, 14, LV_PART_SCROLLBAR);
++  lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SCROLLBAR);
++  lv_obj_set_style_radius(list, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
++  lv_obj_update_layout(list);
++  const int row_width =
++      std::max(600, static_cast<int>(lv_obj_get_width(list)) - 28);
++  const auto &languages = i18n::AvailableLanguages();
++  for (size_t i = 0; i < languages.size(); ++i) {
++    const auto language = languages[i];
++    const bool selected = std::string(i18n::CurrentLanguage()) == language.code;
++    auto *row = Button(list, "", [] {}, selected);
++    lv_obj_set_pos(row, 0, static_cast<int>(i) * 154);
++    lv_obj_set_size(row, row_width, 142);
++    lv_obj_set_style_radius(row, 22, 0);
++    auto *native =
++        Label(row, language.native_name, &lv_font_montserrat_32, kText);
++    lv_obj_set_pos(native, 28, 20);
++    lv_obj_set_width(native, row_width - 180);
++    lv_label_set_long_mode(native, LV_LABEL_LONG_MODE_DOTS);
++    auto *english = Label(row, language.name, &lv_font_montserrat_24, kMuted);
++    lv_obj_set_pos(english, 30, 80);
++    lv_obj_set_width(english, row_width - 180);
++    lv_label_set_long_mode(english, LV_LABEL_LONG_MODE_DOTS);
++    if (selected) {
++      auto *check = Label(row, LV_SYMBOL_OK, &lv_font_montserrat_32, kAccent);
++      lv_obj_align(check, LV_ALIGN_RIGHT_MID, -38, 0);
++    }
++    OnClick(row, [screen, callback, context, language] {
++      // Never block decryption on a preference: a language this build cannot
++      // apply still continues with the one it already had.
++      if (RecoverySetLanguage(language.code)) {
++        i18n::SetLanguage(language.code);
++        RecoveryMarkLanguageChosen();
++        // ApplyDirection reads IsRightToLeft(), so a single call settles both
++        // directions before the decrypt page is built.
++        i18n::ApplyDirection(screen);
++      }
++      ContinueToDecryption(callback, context);
++    });
++  }
++  auto *skip = Button(screen, "Skip / 跳过", [callback, context] {
++    // Skipping is an answer too. Without the record the prompt would return on
++    // every boot, and the build keeps AERA_DEFAULT_LANGUAGE.
++    RecoveryMarkLanguageChosen();
++    ContinueToDecryption(callback, context);
++  });
++  lv_obj_set_pos(skip, 64,
++                 static_cast<int>(lv_obj_get_height(screen)) - footer + 20);
++  lv_obj_set_size(skip, row_width, 128);
++}
++
++}  // namespace aeraui
+diff --git a/aeraui/scenes/scene.hpp b/aeraui/scenes/scene.hpp
+index b90809a..67930bd 100644
+--- a/aeraui/scenes/scene.hpp
++++ b/aeraui/scenes/scene.hpp
+@@ -118,6 +118,11 @@ struct UpdateScene {
+ 
+ void BuildBootScene(lv_obj_t *screen, ActionCallback callback, void *context);
+ void CompleteBootScene(lv_obj_t *screen);
++// Opt-in (AERA_FIRST_BOOT_LANGUAGE) chooser shown once, before the decrypt
++// page, on devices whose build ships more than one language. It never blocks
++// decryption: every path, including a skip, reports Action::kFirstBootLanguageDone.
++void BuildFirstBootLanguageScene(lv_obj_t *screen, ActionCallback callback,
++                                 void *context);
+ void BuildHomeScene(lv_obj_t *screen, ActionCallback callback, void *context);
+ void BuildFilesScene(lv_obj_t *screen, ActionCallback callback, void *context);
+ void BuildToolScene(lv_obj_t *screen, Action tool, ActionCallback callback,
