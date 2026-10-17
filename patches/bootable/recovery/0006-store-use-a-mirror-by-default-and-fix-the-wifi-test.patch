@@ -1,4 +1,4 @@
-From ddeffc0358074f6feb84dccb0467cbe0b7f7e61c Mon Sep 17 00:00:00 2001
+From 47d63bc885e877508502fded8411bf8e4b56f5e1 Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 08:05:17 +0800
 Subject: [PATCH] plugins: reach the store through a mirror and say why a
@@ -32,10 +32,10 @@ The result line names the target that answered.
  2 files changed, 223 insertions(+), 29 deletions(-)
 
 diff --git a/aeraui/features/plugins/plugin_manager.cpp b/aeraui/features/plugins/plugin_manager.cpp
-index efe4da9..04ce154 100644
+index 9f4a9b4..913aa6f 100644
 --- a/aeraui/features/plugins/plugin_manager.cpp
 +++ b/aeraui/features/plugins/plugin_manager.cpp
-@@ -35,8 +35,8 @@ namespace {
+@@ -36,8 +36,8 @@ namespace {
  
  constexpr char kCatalogUrl[] =
      "https://raw.githubusercontent.com/AERA-Plugins/registry/main/catalog.json";
@@ -46,7 +46,7 @@ index efe4da9..04ce154 100644
  constexpr char kCacheRoot[] = "/tmp/aera-plugin-store";
  constexpr char kStorageRoot[] = "/sdcard/AERA/plugins";
  constexpr char kPersistentCacheRoot[] = "/sdcard/AERA/plugins/.store";
-@@ -44,6 +44,11 @@ constexpr char kMemoryRoot[] = "/tmp/aera/plugins";
+@@ -45,6 +45,11 @@ constexpr char kMemoryRoot[] = "/tmp/aera/plugins";
  constexpr uint64_t kMaxCatalog = 1024 * 1024;
  constexpr uint64_t kMaxManifest = 64 * 1024;
  constexpr uint64_t kMaxSignature = 4096;
@@ -58,7 +58,7 @@ index efe4da9..04ce154 100644
  constexpr uint64_t kMaxPayload = 512ULL * 1024 * 1024;
  constexpr uint64_t kMaxPackage = kMaxPayload + 1024 * 1024;
  // Every other downloader in the recovery already puts a deadline on its wget
-@@ -138,6 +143,48 @@ bool OfficialUrl(const std::string &url) {
+@@ -139,6 +144,48 @@ bool OfficialUrl(const std::string &url) {
           url.compare(0, sizeof(github) - 1, github) == 0;
  }
  
@@ -107,7 +107,7 @@ index efe4da9..04ce154 100644
  bool EnsureDirectory(const std::string &path) {
    if (path.empty() || path.front() != '/') return false;
    std::string current;
-@@ -179,6 +226,23 @@ bool ReadBounded(const std::string &path, uint64_t maximum, std::string &data) {
+@@ -180,6 +227,23 @@ bool ReadBounded(const std::string &path, uint64_t maximum, std::string &data) {
    return true;
  }
  
@@ -131,7 +131,7 @@ index efe4da9..04ce154 100644
  bool DecodeSignature(std::string text, std::array<uint8_t, 64> &signature) {
    text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) {
      return std::isspace(c);
-@@ -408,11 +472,13 @@ bool ParseCatalog(const std::string &text, std::vector<Plugin> &plugins,
+@@ -409,11 +473,13 @@ bool ParseCatalog(const std::string &text, std::vector<Plugin> &plugins,
    return true;
  }
  
@@ -150,7 +150,7 @@ index efe4da9..04ce154 100644
      unlink(path.c_str());
  
      // Recovery installs a process-wide SIGCHLD handler which may reap wget
-@@ -528,10 +594,9 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+@@ -529,10 +595,9 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
        if (waited != child) status = 0;
      }
      const bool cancelled = progress && progress->cancel.load();
@@ -164,7 +164,7 @@ index efe4da9..04ce154 100644
      }
      const bool exited_ok =
          reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-@@ -545,13 +610,51 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+@@ -546,13 +611,51 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
        }
        return true;
      }
@@ -218,7 +218,7 @@ index efe4da9..04ce154 100644
  bool HashFile(const std::string &path, uint64_t expected_size,
                const std::string &expected_hash, Progress *progress,
                unsigned progress_start = 78, unsigned progress_end = 96) {
-@@ -860,23 +963,60 @@ bool Refresh(Progress &progress) {
+@@ -862,23 +965,60 @@ bool Refresh(Progress &progress) {
    const std::string manifest = std::string(kCacheRoot) + "/catalog.json.new";
    const std::string signature = manifest + ".sig";
    progress.status = "Downloading signed catalog"; progress.value.store(10);

@@ -1,4 +1,4 @@
-From 7d60ff427a52f57a28edcfd625cdcaeb7b846560 Mon Sep 17 00:00:00 2001
+From d346a8cffa54c4f6bbb4663e91ef6e585f55324c Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 22:36:07 +0800
 Subject: [PATCH] plugins: bound every store download with a deadline
@@ -26,10 +26,10 @@ happy path.
  1 file changed, 80 insertions(+), 13 deletions(-)
 
 diff --git a/aeraui/features/plugins/plugin_manager.cpp b/aeraui/features/plugins/plugin_manager.cpp
-index 98637ce..efe4da9 100644
+index 3fd64cd..9f4a9b4 100644
 --- a/aeraui/features/plugins/plugin_manager.cpp
 +++ b/aeraui/features/plugins/plugin_manager.cpp
-@@ -11,6 +11,7 @@
+@@ -12,6 +12,7 @@
  #include <array>
  #include <cerrno>
  #include <cctype>
@@ -37,7 +37,7 @@ index 98637ce..efe4da9 100644
  #include <cstdio>
  #include <cstring>
  #include <dirent.h>
-@@ -25,6 +26,7 @@
+@@ -26,6 +27,7 @@
  #include <sys/stat.h>
  #include <sys/types.h>
  #include <sys/wait.h>
@@ -45,7 +45,7 @@ index 98637ce..efe4da9 100644
  #include <unistd.h>
  #include <ziparchive/zip_archive.h>
  
-@@ -44,6 +46,17 @@ constexpr uint64_t kMaxManifest = 64 * 1024;
+@@ -45,6 +47,17 @@ constexpr uint64_t kMaxManifest = 64 * 1024;
  constexpr uint64_t kMaxSignature = 4096;
  constexpr uint64_t kMaxPayload = 512ULL * 1024 * 1024;
  constexpr uint64_t kMaxPackage = kMaxPayload + 1024 * 1024;
@@ -63,7 +63,7 @@ index 98637ce..efe4da9 100644
  constexpr std::array<uint8_t, 32> kSigningKey{{
      0x16, 0xee, 0x36, 0x7d, 0xd2, 0xd7, 0xae, 0x19,
      0xa0, 0xd1, 0x62, 0xfb, 0x71, 0x66, 0xe0, 0xf7,
-@@ -404,7 +417,9 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+@@ -405,7 +418,9 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
  
      // Recovery installs a process-wide SIGCHLD handler which may reap wget
      // before this worker reaches waitpid(). Keep a pipe descriptor inherited
@@ -74,7 +74,7 @@ index 98637ce..efe4da9 100644
      int completion[2];
      if (pipe(completion) != 0) return false;
      const pid_t child = fork();
-@@ -442,12 +457,44 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+@@ -443,12 +458,44 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
        progress->total_bytes.store(expected_size);
        progress->value.store(progress_start);
      }
@@ -122,7 +122,7 @@ index 98637ce..efe4da9 100644
        if (progress && expected_size) {
          struct stat partial{};
          if (lstat(path.c_str(), &partial) == 0 && S_ISREG(partial.st_mode) &&
-@@ -460,19 +507,37 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+@@ -461,19 +508,37 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
                static_cast<unsigned>(bytes * span / expected_size));
          }
        }
@@ -169,7 +169,7 @@ index 98637ce..efe4da9 100644
          info.st_size > 0 && static_cast<uint64_t>(info.st_size) <= limit) {
        if (progress && expected_size) {
          progress->downloaded_bytes.store(static_cast<uint64_t>(info.st_size));
-@@ -480,6 +545,8 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+@@ -481,6 +546,8 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
        }
        return true;
      }

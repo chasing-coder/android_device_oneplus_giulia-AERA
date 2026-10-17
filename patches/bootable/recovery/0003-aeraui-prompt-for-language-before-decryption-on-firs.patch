@@ -1,8 +1,8 @@
-From 6460c454c6d3f67e1b13f189f8976ec1b0b50bd8 Mon Sep 17 00:00:00 2001
+From 8d747e48038a56d3438890a837c74509a1fe62f1 Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 13:36:40 +0800
-Subject: [PATCH 3/3] aeraui: prompt for language before decryption on first
- boot (opt-in)
+Subject: [PATCH] aeraui: prompt for language before decryption on first boot
+ (opt-in)
 
 Shown only when AERA_FIRST_BOOT_LANGUAGE is enabled and the build ships more than one language. BeginDecryption() now builds the credential page through a shared ShowDecryptScene() helper and offers the chooser before it; choosing a language or skipping both record the decision and continue, so decryption is never blocked.
 ---
@@ -47,10 +47,10 @@ index 9660a02..ce4571f 100644
  }
  
 diff --git a/aeraui/core/engine.cpp b/aeraui/core/engine.cpp
-index e7ec22f..961bba0 100644
+index 3773776..17da597 100644
 --- a/aeraui/core/engine.cpp
 +++ b/aeraui/core/engine.cpp
-@@ -735,6 +735,8 @@ public:
+@@ -738,6 +738,8 @@ public:
                         int pattern_grid_size) {
      if (interactive_ready_ || backend_ready_) return;
      interactive_ready_ = true;
@@ -59,7 +59,7 @@ index e7ec22f..961bba0 100644
      decryption_active_ = true;
      secondary_decryption_ = false;
      credential_type_ = credential_type;
-@@ -745,14 +747,44 @@ public:
+@@ -748,14 +750,44 @@ public:
      ApplyStoredAppearance();
      lv_obj_t *boot_screen = lv_screen_active();
      CompleteBootScene(boot_screen);
@@ -106,7 +106,7 @@ index e7ec22f..961bba0 100644
    void SetBackendReady() {
      if (backend_ready_)
        return;
-@@ -2383,6 +2415,15 @@ private:
+@@ -2443,6 +2475,15 @@ private:
        return;
      }
  
@@ -122,7 +122,7 @@ index e7ec22f..961bba0 100644
      if (self->decryption_active_) {
        if (action == Action::kDecryptSubmit) {
          self->StartDecryption();
-@@ -3836,6 +3877,11 @@ private:
+@@ -3900,6 +3941,11 @@ private:
    bool operation_visible_ = true;
    int credential_type_ = 0;
    int crypto_user_id_ = 0;
@@ -135,10 +135,10 @@ index e7ec22f..961bba0 100644
    bool wifi_running_ = false;
    bool wifi_scene_report_ = false;
 diff --git a/aeraui/include/aeraui/backend.hpp b/aeraui/include/aeraui/backend.hpp
-index 024f817..b9d6171 100644
+index 8aa2630..050dc42 100644
 --- a/aeraui/include/aeraui/backend.hpp
 +++ b/aeraui/include/aeraui/backend.hpp
-@@ -260,6 +260,10 @@ bool RecoveryDockHideInApps();
+@@ -272,6 +272,10 @@ bool RecoveryDockHideInApps();
  bool RecoverySetDockHideInApps(bool enabled);
  std::string RecoveryLanguage();
  bool RecoverySetLanguage(const std::string &language);
@@ -163,10 +163,10 @@ index 95dcb2f..5fc58c2 100644
  
  enum class DecryptionCompletion {
 diff --git a/aeraui/platform/aera_backend.cpp b/aeraui/platform/aera_backend.cpp
-index 9f23186..65bbc3e 100644
+index 586fa18..78b5f57 100644
 --- a/aeraui/platform/aera_backend.cpp
 +++ b/aeraui/platform/aera_backend.cpp
-@@ -115,6 +115,7 @@ namespace aeraui {
+@@ -118,6 +118,7 @@ namespace aeraui {
  namespace {
  void LoadAeraPreferencesIfAvailable();
  bool SaveAeraPreferences(bool require_early = false);
@@ -174,7 +174,7 @@ index 9f23186..65bbc3e 100644
  bool ResetAeraSettings(bool theme);
  int DefaultHapticDuration(Haptic haptic);
  std::atomic<bool> gSideloadActive{false};
-@@ -124,6 +125,10 @@ std::atomic<uint64_t> gSideloadTotalBytes{0};
+@@ -127,6 +128,10 @@ std::atomic<uint64_t> gSideloadTotalBytes{0};
  bool gLiveFastbootPostDecryptReady = false;
  constexpr const char *kFastbootWifiPreference = "aera_fastboot_wifi";
  constexpr const char *kFastbootProtocolProperty = "fastbootd.protocol";
@@ -185,7 +185,7 @@ index 9f23186..65bbc3e 100644
  
  bool FastbootWifiPrerequisites() {
  #ifdef OF_ENABLE_WLAN
-@@ -2009,6 +2014,23 @@ bool RecoverySetLanguage(const std::string &language) {
+@@ -2135,6 +2140,23 @@ bool RecoverySetLanguage(const std::string &language) {
    }
    return DataManager::SetValue("tw_language", language, 1) == 0;
  }
@@ -209,7 +209,7 @@ index 9f23186..65bbc3e 100644
  std::string RecoveryBrowserHomepage() {
    LoadAeraPreferencesIfAvailable();
    const std::string value = DataManager::GetStrValue("aera_browser_homepage");
-@@ -2139,6 +2161,7 @@ struct EarlyUiPreferences {
+@@ -2274,6 +2296,7 @@ struct EarlyUiPreferences {
    int themed_home_icons;
    int interface_size;
    std::string language;
@@ -217,7 +217,7 @@ index 9f23186..65bbc3e 100644
    std::string keyboard_layout;
    int home_grid_columns;
    int dock_layout;
-@@ -2213,6 +2236,7 @@ EarlyUiPreferences DefaultEarlyUiPreferences() {
+@@ -2348,6 +2371,7 @@ EarlyUiPreferences DefaultEarlyUiPreferences() {
    preferences.themed_home_icons = 0;
    preferences.interface_size = 1;
    preferences.language = AERA_DEFAULT_LANGUAGE;
@@ -225,7 +225,7 @@ index 9f23186..65bbc3e 100644
    preferences.keyboard_layout = "qwerty";
    preferences.home_grid_columns = 3;
    preferences.dock_layout = 0;
-@@ -2273,6 +2297,8 @@ EarlyUiPreferences CaptureCurrentEarlyUiPreferences() {
+@@ -2410,6 +2434,8 @@ EarlyUiPreferences CaptureCurrentEarlyUiPreferences() {
        interface_size.empty() ? 1 : std::clamp(atoi(interface_size.c_str()), 0, 3);
    preferences.language = DataManager::GetStrValue("tw_language");
    if (!ValidLanguage(preferences.language)) preferences.language = AERA_DEFAULT_LANGUAGE;
@@ -234,7 +234,7 @@ index 9f23186..65bbc3e 100644
    preferences.keyboard_layout =
        DataManager::GetStrValue("aera_keyboard_layout") == "qwertz" ? "qwertz" : "qwerty";
    const int home_grid_columns =
-@@ -2437,6 +2463,9 @@ bool SetEarlyUiValue(EarlyUiPreferences* preferences, const std::string& key,
+@@ -2578,6 +2604,9 @@ bool SetEarlyUiValue(EarlyUiPreferences* preferences, const std::string& key,
    } else if (key == "language") {
      if (!ValidLanguage(value)) return false;
      preferences->language = value;
@@ -244,7 +244,7 @@ index 9f23186..65bbc3e 100644
    } else if (key == "keyboard_layout") {
      if (value != "qwerty" && value != "qwertz") return false;
      preferences->keyboard_layout = value;
-@@ -2561,6 +2590,7 @@ void ApplyEarlyUiPreferences(const EarlyUiPreferences& preferences) {
+@@ -2703,6 +2732,7 @@ void ApplyEarlyUiPreferences(const EarlyUiPreferences& preferences) {
    DataManager::SetValue("aera_themed_home_icons", preferences.themed_home_icons);
    DataManager::SetValue("aera_interface_size", preferences.interface_size);
    DataManager::SetValue("tw_language", preferences.language);
@@ -252,7 +252,7 @@ index 9f23186..65bbc3e 100644
    DataManager::SetValue("aera_keyboard_layout", preferences.keyboard_layout);
    DataManager::SetValue("aera_home_grid_columns", preferences.home_grid_columns);
    DataManager::SetValue("aera_dock_layout", preferences.dock_layout);
-@@ -2654,6 +2684,7 @@ std::string SerializeEarlyUiPreferences(const EarlyUiPreferences& preferences) {
+@@ -2798,6 +2828,7 @@ std::string SerializeEarlyUiPreferences(const EarlyUiPreferences& preferences) {
           << "themed_home_icons=" << preferences.themed_home_icons << '\n'
           << "interface_size=" << preferences.interface_size << '\n'
           << "language=" << preferences.language << '\n'
@@ -260,7 +260,7 @@ index 9f23186..65bbc3e 100644
           << "keyboard_layout=" << preferences.keyboard_layout << '\n'
           << "home_grid_columns=" << preferences.home_grid_columns << '\n'
           << "dock_layout=" << preferences.dock_layout << '\n'
-@@ -2770,6 +2801,9 @@ void LoadAeraPreferencesIfAvailable() {
+@@ -2935,6 +2966,9 @@ void LoadAeraPreferencesIfAvailable() {
    if (!input) return;
  
    EarlyUiPreferences full_ui = gEarlyDefaults;
@@ -270,7 +270,7 @@ index 9f23186..65bbc3e 100644
    std::string line;
    while (std::getline(input, line)) {
      if (!line.empty() && line.back() == '\r') line.pop_back();
-@@ -2779,7 +2813,10 @@ void LoadAeraPreferencesIfAvailable() {
+@@ -2944,7 +2978,10 @@ void LoadAeraPreferencesIfAvailable() {
      const std::string value = line.substr(separator + 1);
      bool early_key = false;
      SetEarlyUiValue(&full_ui, key, value, &early_key);
@@ -282,7 +282,7 @@ index 9f23186..65bbc3e 100644
      if (key == "hidden")
        DataManager::SetValue("tw_hidden_files", value);
      else if (key == "compression") DataManager::SetValue(TW_USE_COMPRESSION_VAR, value);
-@@ -2804,6 +2841,9 @@ void LoadAeraPreferencesIfAvailable() {
+@@ -2969,6 +3006,9 @@ void LoadAeraPreferencesIfAvailable() {
      else if (key == "wifi_auto_connect") DataManager::SetValue("of_wlan_auto_connect", value);
      else if (key == "wifi_last_ssid") DataManager::SetValue("of_wlan_last_ssid", value);
    }
@@ -291,8 +291,8 @@ index 9f23186..65bbc3e 100644
 +        DataManager::GetIntValue(kLanguageChosenPreference) != 0 ? 1 : 0;
    ApplyEarlyUiPreferences(full_ui);
    loaded = true;
-   ApplyEarlyUiSideEffects();
-@@ -2850,6 +2890,9 @@ bool SaveAeraPreferences(bool require_early) {
+   gPrimaryWifiPreferencesLoaded = true;
+@@ -3020,6 +3060,9 @@ bool SaveAeraPreferences(bool require_early) {
           << "dock_blur=" << RecoveryDockBlur() << '\n'
           << "dock_hide_apps=" << (RecoveryDockHideInApps() ? 1 : 0) << '\n'
           << "language=" << RecoveryLanguage() << '\n'
@@ -419,3 +419,6 @@ index b90809a..67930bd 100644
  void BuildHomeScene(lv_obj_t *screen, ActionCallback callback, void *context);
  void BuildFilesScene(lv_obj_t *screen, ActionCallback callback, void *context);
  void BuildToolScene(lv_obj_t *screen, Action tool, ActionCallback callback,
+-- 
+2.55.0.windows.3
+

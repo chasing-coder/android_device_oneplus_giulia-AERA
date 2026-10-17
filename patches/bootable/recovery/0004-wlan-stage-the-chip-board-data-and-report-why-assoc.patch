@@ -1,4 +1,4 @@
-From c76c95b878e5e2e7c6b5f7172d8d792b1feff41a Mon Sep 17 00:00:00 2001
+From f9f3f14105663d62d08b7fe00318e2ab7b8bfe3b Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 18:56:50 +0800
 Subject: [PATCH] wlan: stage the chip board data and report why an association
