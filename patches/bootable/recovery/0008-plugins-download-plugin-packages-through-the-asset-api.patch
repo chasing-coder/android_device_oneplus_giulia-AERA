@@ -1,4 +1,4 @@
-From f057355a55c616ea29fa8bae2c390bc7da9976eb Mon Sep 17 00:00:00 2001
+From d3566a88b4a03d9ef4756da1253118a9310206d6 Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 11:47:47 +0800
 Subject: [PATCH] plugins: download plugin packages through the GitHub asset
@@ -17,12 +17,17 @@ up by file name, and the bytes are fetched from the asset endpoint with
 files, and the jsDelivr mirror and the direct URL remain as fallbacks. The
 package's SHA-256 is still checked after the transfer, so a source can only ever
 supply the bytes the catalog already names.
+
+The asset endpoint redirects to objects.githubusercontent.com, which a device
+that cannot reach GitHub directly downloads from at roughly 100 kB/s. The
+ghproxy.net mirror of the same release asset is therefore tried before the API
+and the API stays as the fallback for networks that filter mirror hosts instead.
 ---
- aeraui/features/plugins/plugin_manager.cpp | 137 +++++++++++++++++++--
- 1 file changed, 125 insertions(+), 12 deletions(-)
+ aeraui/features/plugins/plugin_manager.cpp | 145 +++++++++++++++++++--
+ 1 file changed, 133 insertions(+), 12 deletions(-)
 
 diff --git a/aeraui/features/plugins/plugin_manager.cpp b/aeraui/features/plugins/plugin_manager.cpp
-index fb52c1f..89932e5 100644
+index fb52c1f..88b0e10 100644
 --- a/aeraui/features/plugins/plugin_manager.cpp
 +++ b/aeraui/features/plugins/plugin_manager.cpp
 @@ -53,6 +53,7 @@ constexpr char kMemoryRoot[] = "/tmp/aera/plugins";
@@ -159,7 +164,7 @@ index fb52c1f..89932e5 100644
  // Derive the contents-API address of a raw file in the AERA-Plugins org, so the
  // same bytes can be fetched from api.github.com when raw.githubusercontent.com
  // is filtered. Owner, ref and path are preserved exactly.
-@@ -936,25 +1035,39 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+@@ -936,25 +1035,47 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
                Progress *progress = nullptr, unsigned progress_start = 0,
                unsigned progress_end = 0, uint64_t expected_size = 0) {
    if (!OfficialUrl(url) || limit == 0 || limit > kMaxPayload) return false;
@@ -172,12 +177,19 @@ index fb52c1f..89932e5 100644
    std::vector<Candidate> candidates;
    std::string api_url;
 -  if (ApiContentsUrl(url, api_url)) candidates.push_back({api_url, true});
-+  std::string repo_slug, tag, file;
-+  if (ApiContentsUrl(url, api_url)) {
++  const bool contents_api = ApiContentsUrl(url, api_url);
++  bool release_asset = false;
++  if (contents_api) {
 +    candidates.push_back({api_url, Source::ContentsApi});
-+  } else if (ParseReleaseUrl(url, repo_slug, tag, file)) {
-+    candidates.push_back({url, Source::AssetApi});
++  } else {
++    std::string repo_slug, tag, file;
++    release_asset = ParseReleaseUrl(url, repo_slug, tag, file);
 +  }
++  // Release assets: the asset API asks api.github.com for the bytes and gets
++  // redirected to objects.githubusercontent.com, which throttles to roughly
++  // 100 kB/s from networks that cannot reach GitHub directly. The mirror hands
++  // the same file over at full speed, so it is tried first; the API stays as the
++  // fallback for networks that filter mirror hosts instead.
    std::vector<std::string> mirrors;
    AppendMirrors(url, mirrors);
 -  for (const auto &mirror : mirrors) candidates.push_back({mirror, false});
@@ -185,6 +197,7 @@ index fb52c1f..89932e5 100644
 +  for (const auto &mirror : mirrors) {
 +    candidates.push_back({mirror, Source::Transfer});
 +  }
++  if (release_asset) candidates.push_back({url, Source::AssetApi});
 +  candidates.push_back({url, Source::Transfer});
    for (size_t index = 0; index < candidates.size(); ++index) {
      if (progress && progress->cancel.load()) break;
