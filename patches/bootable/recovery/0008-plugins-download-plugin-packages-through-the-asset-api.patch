@@ -1,0 +1,213 @@
+From f057355a55c616ea29fa8bae2c390bc7da9976eb Mon Sep 17 00:00:00 2001
+From: cheng343 <203324649+cheng343@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:47:47 +0800
+Subject: [PATCH] plugins: download plugin packages through the GitHub asset
+ API
+
+The store opens on the contents API, but installation still pulls the package
+from github.com, which is filtered exactly like raw.githubusercontent.com on the
+networks where recovery has no proxy. The root manager already downloads its own
+recovery images through api.github.com, so the same route is known to work from
+this environment.
+
+For a github.com release asset URL the release metadata is now read from
+api.github.com/repos/<owner>/<repo>/releases/tags/<tag>, the asset id is looked
+up by file name, and the bytes are fetched from the asset endpoint with
+"Accept: application/octet-stream". The contents API stays the source for raw
+files, and the jsDelivr mirror and the direct URL remain as fallbacks. The
+package's SHA-256 is still checked after the transfer, so a source can only ever
+supply the bytes the catalog already names.
+---
+ aeraui/features/plugins/plugin_manager.cpp | 137 +++++++++++++++++++--
+ 1 file changed, 125 insertions(+), 12 deletions(-)
+
+diff --git a/aeraui/features/plugins/plugin_manager.cpp b/aeraui/features/plugins/plugin_manager.cpp
+index fb52c1f..89932e5 100644
+--- a/aeraui/features/plugins/plugin_manager.cpp
++++ b/aeraui/features/plugins/plugin_manager.cpp
+@@ -53,6 +53,7 @@ constexpr char kMemoryRoot[] = "/tmp/aera/plugins";
+ constexpr uint64_t kMaxCatalog = 1024 * 1024;
+ constexpr uint64_t kMaxManifest = 64 * 1024;
+ constexpr uint64_t kMaxSignature = 4096;
++constexpr uint64_t kMaxReleaseMetadata = 1024 * 1024;
+ // A real catalog is a few hundred kilobytes. A tiny body is what a captive
+ // portal, a filtering proxy or a half closed connection leaves behind, and
+ // wget stores it with exit status 0 - which used to be reported as a bad
+@@ -485,8 +486,14 @@ bool ParseCatalog(const std::string &text, std::vector<Plugin> &plugins,
+ // in what order; this function only enforces the deadline and the byte limits.
+ bool DownloadOnce(const std::string &url, const std::string &path, uint64_t limit,
+                   Progress *progress, unsigned progress_start,
+-                  unsigned progress_end, uint64_t expected_size) {
++                  unsigned progress_end, uint64_t expected_size,
++                  const char *accept = nullptr) {
+   if (limit == 0 || limit > kMaxPayload) return false;
++  // The release asset endpoint hands over the bytes themselves only when asked
++  // for them explicitly; anything allocated for that argument stays in the parent
++  // so the child does no allocation after fork.
++  std::string accept_argument;
++  if (accept && *accept) accept_argument = std::string("--header=Accept: ") + accept;
+   {
+     unlink(path.c_str());
+ 
+@@ -520,8 +527,20 @@ bool DownloadOnce(const std::string &url, const std::string &path, uint64_t limi
+       umask(077);
+       const char *busybox = access("/sbin/busybox", X_OK) == 0
+                                 ? "/sbin/busybox" : "/system/bin/busybox";
+-      const char *arguments[] = {busybox, "wget", "-q", "-T", "10", "-t", "1",
+-                                 "-O", path.c_str(), url.c_str(), nullptr};
++      const char *arguments[12];
++      size_t count = 0;
++      arguments[count++] = busybox;
++      arguments[count++] = "wget";
++      arguments[count++] = "-q";
++      arguments[count++] = "-T";
++      arguments[count++] = "10";
++      arguments[count++] = "-t";
++      arguments[count++] = "1";
++      if (!accept_argument.empty()) arguments[count++] = accept_argument.c_str();
++      arguments[count++] = "-O";
++      arguments[count++] = path.c_str();
++      arguments[count++] = url.c_str();
++      arguments[count++] = nullptr;
+       execv(busybox, const_cast<char *const *>(arguments));
+       _exit(127);
+     }
+@@ -907,6 +926,86 @@ bool DownloadApiContents(const std::string &url, const std::string &path,
+   return WriteFile(path, decoded);
+ }
+ 
++// Split https://github.com/AERA-Plugins/<repo>/releases/download/<tag>/<file>
++// into the parts the releases API needs.
++bool ParseReleaseUrl(const std::string &url, std::string &repo_slug,
++                     std::string &tag, std::string &file) {
++  constexpr char prefix[] = "https://github.com/AERA-Plugins/";
++  if (url.compare(0, sizeof(prefix) - 1, prefix) != 0) return false;
++  const std::string rest = url.substr(sizeof(prefix) - 1);
++  const size_t repo_end = rest.find('/');
++  if (repo_end == std::string::npos) return false;
++  const std::string repo = rest.substr(0, repo_end);
++  constexpr char marker[] = "releases/download/";
++  const std::string tail = rest.substr(repo_end + 1);
++  if (tail.compare(0, sizeof(marker) - 1, marker) != 0) return false;
++  const std::string asset_path = tail.substr(sizeof(marker) - 1);
++  const size_t tag_end = asset_path.find('/');
++  if (tag_end == std::string::npos) return false;
++  tag = asset_path.substr(0, tag_end);
++  file = asset_path.substr(tag_end + 1);
++  if (repo.empty() || tag.empty() || file.empty() ||
++      file.find('/') != std::string::npos) {
++    return false;
++  }
++  repo_slug = "AERA-Plugins/" + repo;
++  return true;
++}
++
++// Resolve a release asset URL through api.github.com: the release metadata names
++// the asset id, and the asset endpoint answers with the bytes themselves when
++// asked for application/octet-stream. This is the route the root manager already
++// updates through, and it works where raw.githubusercontent.com and github.com
++// are filtered.
++bool DownloadApiAsset(const std::string &url, const std::string &path,
++                      uint64_t limit, Progress *progress, unsigned start,
++                      unsigned end, uint64_t expected_size) {
++  std::string repo_slug, tag, file;
++  if (!ParseReleaseUrl(url, repo_slug, tag, file)) return false;
++  const std::string metadata = std::string(kCacheRoot) + "/release.json";
++  const std::string metadata_url =
++      "https://api.github.com/repos/" + repo_slug + "/releases/tags/" + tag;
++  const bool fetched = DownloadOnce(metadata_url, metadata, kMaxReleaseMetadata,
++                                    nullptr, 0, 0, 0);
++  std::string text;
++  const bool read_ok =
++      fetched && ReadBounded(metadata, kMaxReleaseMetadata, text);
++  unlink(metadata.c_str());
++  Json::Value root;
++  if (!read_ok || !ParseJson(text, root) || !root.isObject()) {
++    fprintf(stderr,
++            "AERA plugins: release metadata for %s@%s failed (download=%d, "
++            "%zu B)\n",
++            repo_slug.c_str(), tag.c_str(), fetched ? 1 : 0, text.size());
++    return false;
++  }
++  std::string asset_id;
++  const Json::Value &assets = root["assets"];
++  if (assets.isArray()) {
++    for (const auto &asset : assets) {
++      if (!asset.isObject()) continue;
++      if (asset.get("name", "").asString() != file) continue;
++      if (asset.get("size", 0).asUInt64() > limit) return false;
++      const Json::Value &id = asset["id"];
++      if (id.isUInt64()) {
++        asset_id = std::to_string(id.asUInt64());
++      } else if (id.isInt()) {
++        asset_id = std::to_string(id.asInt());
++      }
++      break;
++    }
++  }
++  if (asset_id.empty()) {
++    fprintf(stderr, "AERA plugins: %s@%s has no asset named %s\n",
++            repo_slug.c_str(), tag.c_str(), file.c_str());
++    return false;
++  }
++  return DownloadOnce("https://api.github.com/repos/" + repo_slug +
++                          "/releases/assets/" + asset_id,
++                      path, limit, progress, start, end, expected_size,
++                      "application/octet-stream");
++}
++
+ // Derive the contents-API address of a raw file in the AERA-Plugins org, so the
+ // same bytes can be fetched from api.github.com when raw.githubusercontent.com
+ // is filtered. Owner, ref and path are preserved exactly.
+@@ -936,25 +1035,39 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+               Progress *progress = nullptr, unsigned progress_start = 0,
+               unsigned progress_end = 0, uint64_t expected_size = 0) {
+   if (!OfficialUrl(url) || limit == 0 || limit > kMaxPayload) return false;
++  enum class Source { ContentsApi, AssetApi, Transfer };
+   struct Candidate {
+     std::string url;
+-    bool contents_api;
++    Source source;
+   };
+   std::vector<Candidate> candidates;
+   std::string api_url;
+-  if (ApiContentsUrl(url, api_url)) candidates.push_back({api_url, true});
++  std::string repo_slug, tag, file;
++  if (ApiContentsUrl(url, api_url)) {
++    candidates.push_back({api_url, Source::ContentsApi});
++  } else if (ParseReleaseUrl(url, repo_slug, tag, file)) {
++    candidates.push_back({url, Source::AssetApi});
++  }
+   std::vector<std::string> mirrors;
+   AppendMirrors(url, mirrors);
+-  for (const auto &mirror : mirrors) candidates.push_back({mirror, false});
+-  candidates.push_back({url, false});
++  for (const auto &mirror : mirrors) {
++    candidates.push_back({mirror, Source::Transfer});
++  }
++  candidates.push_back({url, Source::Transfer});
+   for (size_t index = 0; index < candidates.size(); ++index) {
+     if (progress && progress->cancel.load()) break;
+     const Candidate &candidate = candidates[index];
+-    const bool ok = candidate.contents_api
+-        ? DownloadApiContents(candidate.url, path, limit, progress,
+-                              progress_start, progress_end)
+-        : DownloadOnce(candidate.url, path, limit, progress, progress_start,
+-                       progress_end, expected_size);
++    bool ok = false;
++    if (candidate.source == Source::ContentsApi) {
++      ok = DownloadApiContents(candidate.url, path, limit, progress,
++                               progress_start, progress_end);
++    } else if (candidate.source == Source::AssetApi) {
++      ok = DownloadApiAsset(candidate.url, path, limit, progress,
++                            progress_start, progress_end, expected_size);
++    } else {
++      ok = DownloadOnce(candidate.url, path, limit, progress, progress_start,
++                        progress_end, expected_size);
++    }
+     if (ok) {
+       if (HostOf(candidate.url) != HostOf(url)) {
+         fprintf(stderr, "AERA plugins: %s delivered by %s\n", url.c_str(),
+-- 
+2.55.0.windows.3
+
