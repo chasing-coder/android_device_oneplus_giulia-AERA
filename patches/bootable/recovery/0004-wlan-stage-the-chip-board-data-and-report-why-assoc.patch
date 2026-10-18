@@ -1,8 +1,8 @@
-From f9f3f14105663d62d08b7fe00318e2ab7b8bfe3b Mon Sep 17 00:00:00 2001
+From 0c487a7697029db066aa6fb935697801d929dc6e Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 18:56:50 +0800
-Subject: [PATCH] wlan: stage the chip board data and report why an association
- fails
+Subject: [PATCH 4/8] wlan: stage the chip board data and report why an
+ association fails
 
 Recovery boots with the kernel firmware loader pointed at the ramdisk
 (firmware_class.path=/vendor/firmware) because the modem vfat mount cannot
@@ -689,6 +689,3 @@ index 4ea8c5b..8fa7bcd 100644
      static bool WaitForProperty(const std::string& key, const std::string& expected, int timeout_ms);
      static bool WaitForSupplicantReady(int timeout_ms);
      static bool StartInitSupplicantService();
--- 
-2.55.0.windows.3
-

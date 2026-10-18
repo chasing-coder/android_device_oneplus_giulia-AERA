@@ -1,7 +1,8 @@
-From d6d1b001077e98e0bb0f1f90dc5e1f275f1550ad Mon Sep 17 00:00:00 2001
+From f19c18ac0236904e6ce396804922b820a1681e6b Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 12:45:03 +0800
-Subject: [PATCH] wlan: configure the network wpa_supplicant actually created
+Subject: [PATCH 1/8] wlan: configure the network wpa_supplicant actually
+ created
 
 Connect() dropped the id returned by ADD_NETWORK and then addressed network 0
 for SET_NETWORK/ENABLE_NETWORK/SELECT_NETWORK. wpa_supplicant never reuses an
@@ -294,6 +295,3 @@ index ef51095..5a8b125 100644
  }
  
  bool Wlan::SuppCmd(const std::string& ctrl_cmd) {
--- 
-2.55.0.windows.3
-

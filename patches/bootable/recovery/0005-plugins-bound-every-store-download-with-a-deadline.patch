@@ -1,7 +1,7 @@
-From d346a8cffa54c4f6bbb4663e91ef6e585f55324c Mon Sep 17 00:00:00 2001
+From f2d30a57346b76310cd230815b887fb500c08b3e Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 22:36:07 +0800
-Subject: [PATCH] plugins: bound every store download with a deadline
+Subject: [PATCH 5/8] plugins: bound every store download with a deadline
 
 The store worker waited for the completion pipe only. Recovery installs a
 process wide SIGCHLD handler that can reap wget first, and every other fork in
@@ -178,6 +178,3 @@ index 3fd64cd..9f4a9b4 100644
    }
    unlink(path.c_str());
    return false;
--- 
-2.55.0.windows.3
-

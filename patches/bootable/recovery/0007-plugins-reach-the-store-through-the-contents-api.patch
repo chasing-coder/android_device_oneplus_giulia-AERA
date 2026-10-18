@@ -1,7 +1,7 @@
-From c17024f6fee4799032c076fdbc3c1d674ba060ed Mon Sep 17 00:00:00 2001
+From 89fb4cd66cd4dcf69790a7c88a5145e9eaa46421 Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 11:24:43 +0800
-Subject: [PATCH] plugins: fetch the store through the GitHub contents API
+Subject: [PATCH 7/8] plugins: fetch the store through the GitHub contents API
  first
 
 Recovery cannot reach raw.githubusercontent.com on filtered networks, and in
@@ -271,6 +271,3 @@ index 913aa6f..fb52c1f 100644
                TrimmedLength(signature_text), read_ok ? 1 : 0, size_ok ? 1 : 0,
                decode_ok ? 1 : 0, PrintablePrefix(content, 24).c_str());
      }
--- 
-2.55.0.windows.3
-

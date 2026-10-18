@@ -1,7 +1,7 @@
-From 47d63bc885e877508502fded8411bf8e4b56f5e1 Mon Sep 17 00:00:00 2001
+From aeafae2a390172734b489acdba22ad54caf05949 Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 08:05:17 +0800
-Subject: [PATCH] plugins: reach the store through a mirror and say why a
+Subject: [PATCH 6/8] plugins: reach the store through a mirror and say why a
  transfer failed
 
 Recovery has no proxy of its own, so on networks that filter GitHub the store
@@ -383,6 +383,3 @@ index b63e749..64175a3 100644
              "DNS: Failed",
              "Name lookup may be broken.");
          return true;
--- 
-2.55.0.windows.3
-

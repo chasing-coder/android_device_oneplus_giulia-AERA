@@ -1,8 +1,8 @@
-From a53bac67561af741c6eb4e0cee1319249d952a73 Mon Sep 17 00:00:00 2001
+From 43470522270772d9e2adbf5ce6340705d110ca0c Mon Sep 17 00:00:00 2001
 From: cheng343 <203324649+cheng343@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 11:47:47 +0800
-Subject: [PATCH] plugins: download plugin packages through the GitHub asset
- API
+Subject: [PATCH 8/8] plugins: download plugin packages through the GitHub
+ asset API
 
 The store opens on the contents API, but installation still pulls the package
 from github.com, which is filtered exactly like raw.githubusercontent.com on the
@@ -219,6 +219,3 @@ index fb52c1f..f2bf618 100644
      if (ok) {
        if (HostOf(candidate.url) != HostOf(url)) {
          fprintf(stderr, "AERA plugins: %s delivered by %s\n", url.c_str(),
--- 
-2.55.0.windows.3
-
