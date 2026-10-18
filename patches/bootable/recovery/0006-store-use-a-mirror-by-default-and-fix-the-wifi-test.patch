@@ -1,0 +1,385 @@
+From aeafae2a390172734b489acdba22ad54caf05949 Mon Sep 17 00:00:00 2001
+From: cheng343 <203324649+cheng343@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 08:05:17 +0800
+Subject: [PATCH 6/8] plugins: reach the store through a mirror and say why a
+ transfer failed
+
+Recovery has no proxy of its own, so on networks that filter GitHub the store
+could never load. Run 19 replaced the endless wait with a fast failure, and the
+device log shows wget exiting non-zero before anything was verified.
+
+- Download() now tries a public mirror of the same repository first (jsDelivr
+  for raw files, ghproxy.net for release assets) and keeps the official URL as
+  the fallback. Every byte still has to pass the caller's signature or SHA-256
+  check, so a mirror cannot introduce anything the release key did not sign.
+- DownloadOnce() logs the wget exit code and byte count when a transfer fails,
+  instead of leaving the caller to report only "could not download".
+- Refresh() walks the same source list, keeps the catalog and its signature
+  from a single host, treats an implausibly small body as a broken transfer,
+  logs the received size, signature length and first bytes, and keeps the bytes
+  in /tmp/aera-plugin-store/*.failed for inspection.
+
+wlan: the connection test no longer fails on a filtered 1.1.1.1
+
+TestConnection() judged "Internet" by a single ICMP probe to 1.1.1.1, which
+plenty of networks blackhole, so a working WLAN reported "Internet: Failed".
+It now asks the default gateway, then 223.5.5.5, 119.29.29.29, 8.8.8.8 and
+1.1.1.1, and finally performs a small HTTP fetch for networks that drop ICMP.
+The result line names the target that answered.
+---
+ aeraui/features/plugins/plugin_manager.cpp | 192 ++++++++++++++++++---
+ wlan.cpp                                   |  60 ++++++-
+ 2 files changed, 223 insertions(+), 29 deletions(-)
+
+diff --git a/aeraui/features/plugins/plugin_manager.cpp b/aeraui/features/plugins/plugin_manager.cpp
+index 9f4a9b4..913aa6f 100644
+--- a/aeraui/features/plugins/plugin_manager.cpp
++++ b/aeraui/features/plugins/plugin_manager.cpp
+@@ -36,8 +36,8 @@ namespace {
+ 
+ constexpr char kCatalogUrl[] =
+     "https://raw.githubusercontent.com/AERA-Plugins/registry/main/catalog.json";
+-constexpr char kCatalogSignatureUrl[] =
+-    "https://raw.githubusercontent.com/AERA-Plugins/registry/main/catalog.json.sig";
++// The signature always lives next to whichever catalog source is used.
++constexpr char kCatalogSuffix[] = ".sig";
+ constexpr char kCacheRoot[] = "/tmp/aera-plugin-store";
+ constexpr char kStorageRoot[] = "/sdcard/AERA/plugins";
+ constexpr char kPersistentCacheRoot[] = "/sdcard/AERA/plugins/.store";
+@@ -45,6 +45,11 @@ constexpr char kMemoryRoot[] = "/tmp/aera/plugins";
+ constexpr uint64_t kMaxCatalog = 1024 * 1024;
+ constexpr uint64_t kMaxManifest = 64 * 1024;
+ constexpr uint64_t kMaxSignature = 4096;
++// A real catalog is a few hundred kilobytes. A tiny body is what a captive
++// portal, a filtering proxy or a half closed connection leaves behind, and
++// wget stores it with exit status 0 - which used to be reported as a bad
++// signature rather than as a bad transfer.
++constexpr uint64_t kMinCatalog = 1024;
+ constexpr uint64_t kMaxPayload = 512ULL * 1024 * 1024;
+ constexpr uint64_t kMaxPackage = kMaxPayload + 1024 * 1024;
+ // Every other downloader in the recovery already puts a deadline on its wget
+@@ -139,6 +144,48 @@ bool OfficialUrl(const std::string &url) {
+          url.compare(0, sizeof(github) - 1, github) == 0;
+ }
+ 
++std::string HostOf(const std::string &url) {
++  const size_t start = url.find("://");
++  const size_t begin = start == std::string::npos ? 0 : start + 3;
++  const size_t end = url.find('/', begin);
++  return url.substr(begin, end == std::string::npos ? std::string::npos
++                                                    : end - begin);
++}
++
++// Recovery has no proxy of its own, and in some networks GitHub cannot be
++// reached directly: raw.githubusercontent.com is either blocked outright or
++// answered by a filtering middlebox, so wget exits non-zero and the store shows
++// an empty catalog. A single public mirror of the same repository is therefore
++// tried first, with the official URL kept as the fallback.
++//
++// The mirror is derived from a URL that already passed OfficialUrl(), and the
++// bytes it returns still have to pass the identical signature or SHA-256 check,
++// so a mirror cannot make anything trusted that was not signed by the AERA
++// release key.
++void AppendMirrors(const std::string &url, std::vector<std::string> &urls) {
++  constexpr char raw_prefix[] = "https://raw.githubusercontent.com/AERA-Plugins/";
++  constexpr char site_prefix[] = "https://github.com/AERA-Plugins/";
++  if (url.compare(0, sizeof(raw_prefix) - 1, raw_prefix) == 0) {
++    // <owner>/<repo>/<ref>/<path...> -> jsDelivr's gh endpoint.
++    const std::string rest = url.substr(sizeof(raw_prefix) - 1);
++    const size_t repo_end = rest.find('/');
++    const size_t ref_end =
++        repo_end == std::string::npos ? std::string::npos
++                                      : rest.find('/', repo_end + 1);
++    if (repo_end == std::string::npos || ref_end == std::string::npos) return;
++    const std::string repo = rest.substr(0, repo_end);
++    const std::string ref = rest.substr(repo_end + 1, ref_end - repo_end - 1);
++    const std::string path = rest.substr(ref_end + 1);
++    if (repo.empty() || ref.empty() || path.empty()) return;
++    urls.push_back("https://cdn.jsdelivr.net/gh/AERA-Plugins/" + repo + "@" +
++                   ref + "/" + path);
++  }
++  if (url.compare(0, sizeof(site_prefix) - 1, site_prefix) == 0) {
++    // Release assets: <owner>/<repo>/releases/download/<tag>/<file>.
++    urls.push_back("https://ghproxy.net/" + url);
++  }
++}
++
+ bool EnsureDirectory(const std::string &path) {
+   if (path.empty() || path.front() != '/') return false;
+   std::string current;
+@@ -180,6 +227,23 @@ bool ReadBounded(const std::string &path, uint64_t maximum, std::string &data) {
+   return true;
+ }
+ 
++size_t TrimmedLength(const std::string &text) {
++  size_t count = 0;
++  for (unsigned char c : text) {
++    if (!std::isspace(c)) ++count;
++  }
++  return count;
++}
++
++std::string PrintablePrefix(const std::string &text, size_t maximum) {
++  std::string out;
++  for (size_t i = 0; i < text.size() && i < maximum; ++i) {
++    const unsigned char c = static_cast<unsigned char>(text[i]);
++    out.push_back(c >= 0x20 && c < 0x7f ? static_cast<char>(c) : '.');
++  }
++  return out;
++}
++
+ bool DecodeSignature(std::string text, std::array<uint8_t, 64> &signature) {
+   text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) {
+     return std::isspace(c);
+@@ -409,11 +473,13 @@ bool ParseCatalog(const std::string &text, std::vector<Plugin> &plugins,
+   return true;
+ }
+ 
+-bool Download(const std::string &url, const std::string &path, uint64_t limit,
+-              Progress *progress = nullptr, unsigned progress_start = 0,
+-              unsigned progress_end = 0, uint64_t expected_size = 0) {
+-  if (!OfficialUrl(url) || limit == 0 || limit > kMaxPayload) return false;
+-  for (unsigned attempt = 0; attempt < 3; ++attempt) {
++// One transfer from exactly one URL. The caller decides which URLs to try and
++// in what order; this function only enforces the deadline and the byte limits.
++bool DownloadOnce(const std::string &url, const std::string &path, uint64_t limit,
++                  Progress *progress, unsigned progress_start,
++                  unsigned progress_end, uint64_t expected_size) {
++  if (limit == 0 || limit > kMaxPayload) return false;
++  {
+     unlink(path.c_str());
+ 
+     // Recovery installs a process-wide SIGCHLD handler which may reap wget
+@@ -529,10 +595,9 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+       if (waited != child) status = 0;
+     }
+     const bool cancelled = progress && progress->cancel.load();
+-    if (timed_out || cancelled) {
+-      fprintf(stderr, "AERA plugins: download of %s %s after %llu ms\n",
+-              url.c_str(), cancelled ? "cancelled" : "stalled",
+-              static_cast<unsigned long long>(timeout_ms));
++    if (cancelled || timed_out) {
++      fprintf(stderr, "AERA plugins: download of %s %s\n", url.c_str(),
++              cancelled ? "cancelled" : "gave up: no data within the deadline");
+     }
+     const bool exited_ok =
+         reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+@@ -546,13 +611,51 @@ bool Download(const std::string &url, const std::string &path, uint64_t limit,
+       }
+       return true;
+     }
+-    // A stalled or cancelled attempt is not worth two more identical waits.
+-    if (timed_out || cancelled) break;
++    if (!cancelled && !timed_out) {
++      // wget can exit non-zero after writing a partial file (poisoned DNS, a
++      // reset mid-transfer or an HTTP error body), and recovery has no shell to
++      // check by hand: state the reason here, where it is still known.
++      fprintf(stderr,
++              "AERA plugins: download of %s failed (wget exit %d, %lld bytes)\n",
++              url.c_str(), reaped && WIFEXITED(status) ? WEXITSTATUS(status) : -1,
++              static_cast<long long>(info.st_size));
++    }
+   }
+   unlink(path.c_str());
+   return false;
+ }
+ 
++// Try a public mirror of the very same repository first, then the official URL:
++// recovery has no proxy of its own, and in networks where GitHub is filtered the
++// direct attempt is what fails, which used to leave the store permanently empty.
++// Whatever bytes arrive still have to pass the caller's signature or SHA-256
++// check, so a mirror can only ever supply identical content.
++bool Download(const std::string &url, const std::string &path, uint64_t limit,
++              Progress *progress = nullptr, unsigned progress_start = 0,
++              unsigned progress_end = 0, uint64_t expected_size = 0) {
++  if (!OfficialUrl(url) || limit == 0 || limit > kMaxPayload) return false;
++  std::vector<std::string> candidates;
++  AppendMirrors(url, candidates);
++  candidates.push_back(url);
++  for (size_t index = 0; index < candidates.size(); ++index) {
++    if (progress && progress->cancel.load()) break;
++    if (DownloadOnce(candidates[index], path, limit, progress, progress_start,
++                     progress_end, expected_size)) {
++      if (HostOf(candidates[index]) != HostOf(url)) {
++        fprintf(stderr, "AERA plugins: %s delivered by %s\n", url.c_str(),
++                HostOf(candidates[index]).c_str());
++      }
++      return true;
++    }
++    if (index + 1 < candidates.size()) {
++      fprintf(stderr, "AERA plugins: %s unavailable, trying %s\n", url.c_str(),
++              HostOf(candidates[index + 1]).c_str());
++    }
++  }
++  fprintf(stderr, "AERA plugins: no source could deliver %s\n", url.c_str());
++  return false;
++}
++
+ bool HashFile(const std::string &path, uint64_t expected_size,
+               const std::string &expected_hash, Progress *progress,
+               unsigned progress_start = 78, unsigned progress_end = 96) {
+@@ -862,23 +965,60 @@ bool Refresh(Progress &progress) {
+   const std::string manifest = std::string(kCacheRoot) + "/catalog.json.new";
+   const std::string signature = manifest + ".sig";
+   progress.status = "Downloading signed catalog"; progress.value.store(10);
+-  if (!Download(kCatalogUrl, manifest, kMaxCatalog)) {
++
++  // The catalog and its signature have to come from the same host: one mirror
++  // may still be serving a cached revision of the catalog while another has the
++  // fresh signature, and a mixed pair fails verification for no real reason.
++  // Each source is verified with the release key before it is accepted, so this
++  // is only about reachability, never about trust. The mirror is tried first
++  // because recovery cannot reach GitHub on some networks; the official URL
++  // stays as the fallback.
++  std::vector<std::string> sources;
++  AppendMirrors(kCatalogUrl, sources);
++  sources.push_back(kCatalogUrl);
++  std::string content, signature_text;
++  bool verified = false;
++  bool any_fetched = false;
++  for (size_t index = 0; index < sources.size() && !verified; ++index) {
++    const std::string source = sources[index];
++    const std::string signature_url = source + kCatalogSuffix;
++    content.clear(); signature_text.clear();
+     unlink(manifest.c_str()); unlink(signature.c_str());
+-    progress.error = "Could not download the AERA plugin catalog."; return false;
++    const bool fetched =
++        DownloadOnce(source, manifest, kMaxCatalog, nullptr, 0, 0, 0) &&
++        DownloadOnce(signature_url, signature, kMaxSignature, nullptr, 0, 0, 0);
++    any_fetched = any_fetched || fetched;
++    progress.value.store(45);
++    const bool read_ok =
++        fetched && ReadBounded(manifest, kMaxCatalog, content) &&
++        ReadBounded(signature, kMaxSignature, signature_text);
++    // A catalog that is implausibly small is a broken transfer rather than a
++    // bad signature: a captive portal or a filtering proxy answers with a tiny
++    // HTML page and wget stores it with exit status 0, so the old code blamed
++    // the signature. Log what actually arrived and move on to the next source.
++    const bool size_ok = read_ok && content.size() >= kMinCatalog;
++    std::array<uint8_t, 64> decoded{};
++    const bool decode_ok = size_ok && DecodeSignature(signature_text, decoded);
++    verified = decode_ok && Verify(content, signature_text);
++    if (!verified) {
++      fprintf(stderr,
++              "AERA plugins: source %zu (%s) failed: download=%d catalog=%zu B "
++              "signature=%zu chars read=%d size=%d decode=%d prefix=\"%s\"\n",
++              index + 1, HostOf(source).c_str(), fetched ? 1 : 0, content.size(),
++              TrimmedLength(signature_text), read_ok ? 1 : 0, size_ok ? 1 : 0,
++              decode_ok ? 1 : 0, PrintablePrefix(content, 24).c_str());
++    }
+   }
+-  progress.value.store(45);
+-  if (!Download(kCatalogSignatureUrl, signature, kMaxSignature)) {
+-    unlink(manifest.c_str()); unlink(signature.c_str());
+-    progress.error = "Could not download the AERA plugin catalog."; return false;
++  if (!verified) {
++    // Keep the received bytes: they are the only evidence of what the network
++    // actually delivered, and they stay in tmpfs so they cost nothing.
++    rename(manifest.c_str(), (std::string(kCacheRoot) + "/catalog.json.failed").c_str());
++    rename(signature.c_str(), (std::string(kCacheRoot) + "/catalog.json.sig.failed").c_str());
++    progress.error = any_fetched ? "The plugin catalog signature is invalid."
++                                 : "Could not download the AERA plugin catalog.";
++    return false;
+   }
+   progress.value.store(75);
+-  std::string content, signature_text;
+-  if (!ReadBounded(manifest, kMaxCatalog, content) ||
+-      !ReadBounded(signature, kMaxSignature, signature_text) ||
+-      !Verify(content, signature_text)) {
+-    unlink(manifest.c_str()); unlink(signature.c_str());
+-    progress.error = "The plugin catalog signature is invalid."; return false;
+-  }
+   progress.value.store(84);
+   std::vector<Plugin> parsed; std::string error;
+   if (!ParseCatalog(content, parsed, error)) {
+diff --git a/wlan.cpp b/wlan.cpp
+index b63e749..64175a3 100644
+--- a/wlan.cpp
++++ b/wlan.cpp
+@@ -1388,21 +1388,75 @@ bool Wlan::TestConnection()
+     if (busybox.empty())
+         busybox = "busybox";
+ 
++    // One ICMP probe to 1.1.1.1 is not a connection test: plenty of networks
++    // blackhole that address while the link carries traffic perfectly well,
++    // which made a working WLAN report "Internet: Failed". Ask the default
++    // gateway first, then several well known resolvers, and finish with a tiny
++    // HTTP fetch for networks that drop ICMP altogether.
+     std::string internet_output;
+-    bool internet_ok = RunCommand(busybox + " ping -c 1 -w 4 1.1.1.1 2>&1", internet_output);
++    bool internet_ok = false;
++    std::string internet_source;
++
++    std::string route_output;
++    if (RunCommand(busybox + " ip route 2>&1", route_output)) {
++        std::istringstream routes(route_output);
++        std::string line;
++        while (std::getline(routes, line)) {
++            if (line.compare(0, 7, "default") != 0)
++                continue;
++            const size_t via = line.find("via ");
++            if (via == std::string::npos)
++                continue;
++            const size_t start = via + 4;
++            const size_t end = line.find_first_of(" \t", start);
++            const std::string gateway =
++                line.substr(start, end == std::string::npos ? std::string::npos : end - start);
++            if (!gateway.empty() &&
++                RunCommand(busybox + " ping -c 1 -w 3 " + gateway + " 2>&1", internet_output)) {
++                internet_ok = true;
++                internet_source = gateway;
++            }
++            break;
++        }
++    }
++
++    static const char *const kInternetTargets[] = {"223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"};
++    for (size_t i = 0; !internet_ok && i < sizeof(kInternetTargets) / sizeof(kInternetTargets[0]); ++i) {
++        std::string output;
++        if (RunCommand(busybox + " ping -c 1 -w 4 " + kInternetTargets[i] + " 2>&1", output)) {
++            internet_ok = true;
++            internet_source = kInternetTargets[i];
++            internet_output = output;
++        }
++    }
++
++    if (!internet_ok &&
++        (RunCommand(busybox + " wget -q -T 8 -t 1 -O /dev/null http://connect.rom.miui.com/generate_204 2>&1",
++                    internet_output) ||
++         RunCommand(busybox + " wget -q -T 8 -t 1 -O /dev/null http://www.baidu.com/ 2>&1",
++                    internet_output))) {
++        internet_ok = true;
++        internet_source = "HTTP";
++    }
+ 
+     std::string dns_output;
+     bool dns_ok = RunCommand(busybox + " ping -c 1 -w 4 bing.com 2>&1", dns_output);
+ 
++    LOGINFO("WLAN test internet source: %s\n", internet_source.c_str());
+     LOGINFO("WLAN test internet output:\n%s\n", internet_output.c_str());
+     LOGINFO("WLAN test DNS output:\n%s\n", dns_output.c_str());
+ 
++    const std::string internet_line = internet_ok
++        ? (internet_source.empty() ? std::string("Internet: OK")
++                                   : "Internet: OK (" + internet_source + ")")
++        : std::string("Internet: Failed");
++
+     if (internet_ok && dns_ok) {
+         SetWlanTestResult(
+             "Network Connection",
+             "Connected: " + ssid,
+             "IP address: " + ip_addr,
+-            "Internet: OK",
++            internet_line,
+             "DNS: OK",
+             "");
+         return true;
+@@ -1413,7 +1467,7 @@ bool Wlan::TestConnection()
+             "Network Connection",
+             "Connected: " + ssid,
+             "IP address: " + ip_addr,
+-            "Internet: OK",
++            internet_line,
+             "DNS: Failed",
+             "Name lookup may be broken.");
+         return true;

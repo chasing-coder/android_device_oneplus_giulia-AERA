@@ -1,0 +1,273 @@
+From 89fb4cd66cd4dcf69790a7c88a5145e9eaa46421 Mon Sep 17 00:00:00 2001
+From: cheng343 <203324649+cheng343@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:24:43 +0800
+Subject: [PATCH 7/8] plugins: fetch the store through the GitHub contents API
+ first
+
+Recovery cannot reach raw.githubusercontent.com on filtered networks, and in
+that case the store page fails with "Could not download the AERA plugin
+catalog." The contents API lives on api.github.com, the same host the root
+manager already updates through on the device.
+
+Every raw.githubusercontent.com file is now also offered as
+api.github.com/repos/<owner>/<repo>/contents/<path>?ref=<ref> (base64 inside a
+JSON envelope, decoded locally) and tried before the jsDelivr mirror and the
+direct URL. The catalog and its signature are fetched with the same decoder,
+still from a single source each. All verification stays after the transfer -
+Ed25519 signature over the catalog, SHA-256 over every plugin file and the size
+limits - so no source can inject data.
+---
+ aeraui/features/plugins/plugin_manager.cpp | 206 ++++++++++++++++-----
+ 1 file changed, 163 insertions(+), 43 deletions(-)
+
+diff --git a/aeraui/features/plugins/plugin_manager.cpp b/aeraui/features/plugins/plugin_manager.cpp
+index 913aa6f..fb52c1f 100644
+--- a/aeraui/features/plugins/plugin_manager.cpp
++++ b/aeraui/features/plugins/plugin_manager.cpp
+@@ -38,6 +38,14 @@ constexpr char kCatalogUrl[] =
+     "https://raw.githubusercontent.com/AERA-Plugins/registry/main/catalog.json";
+ // The signature always lives next to whichever catalog source is used.
+ constexpr char kCatalogSuffix[] = ".sig";
++// api.github.com is reachable from recovery even where raw.githubusercontent.com
++// is filtered - the AERA root manager fetches its own releases from this exact
++// host and works. The contents API answers with the file base64 encoded inside a
++// JSON envelope, which is why this source needs its own decoder below.
++constexpr char kCatalogApiUrl[] =
++    "https://api.github.com/repos/AERA-Plugins/registry/contents/catalog.json?ref=main";
++constexpr char kCatalogApiSignatureUrl[] =
++    "https://api.github.com/repos/AERA-Plugins/registry/contents/catalog.json.sig?ref=main";
+ constexpr char kCacheRoot[] = "/tmp/aera-plugin-store";
+ constexpr char kStorageRoot[] = "/sdcard/AERA/plugins";
+ constexpr char kPersistentCacheRoot[] = "/sdcard/AERA/plugins/.store";
+@@ -625,37 +633,6 @@ bool DownloadOnce(const std::string &url, const std::string &path, uint64_t limi
+   return false;
+ }
+ 
+-// Try a public mirror of the very same repository first, then the official URL:
+-// recovery has no proxy of its own, and in networks where GitHub is filtered the
+-// direct attempt is what fails, which used to leave the store permanently empty.
+-// Whatever bytes arrive still have to pass the caller's signature or SHA-256
+-// check, so a mirror can only ever supply identical content.
+-bool Download(const std::string &url, const std::string &path, uint64_t limit,
+-              Progress *progress = nullptr, unsigned progress_start = 0,
+-              unsigned progress_end = 0, uint64_t expected_size = 0) {
+-  if (!OfficialUrl(url) || limit == 0 || limit > kMaxPayload) return false;
+-  std::vector<std::string> candidates;
+-  AppendMirrors(url, candidates);
+-  candidates.push_back(url);
+-  for (size_t index = 0; index < candidates.size(); ++index) {
+-    if (progress && progress->cancel.load()) break;
+-    if (DownloadOnce(candidates[index], path, limit, progress, progress_start,
+-                     progress_end, expected_size)) {
+-      if (HostOf(candidates[index]) != HostOf(url)) {
+-        fprintf(stderr, "AERA plugins: %s delivered by %s\n", url.c_str(),
+-                HostOf(candidates[index]).c_str());
+-      }
+-      return true;
+-    }
+-    if (index + 1 < candidates.size()) {
+-      fprintf(stderr, "AERA plugins: %s unavailable, trying %s\n", url.c_str(),
+-              HostOf(candidates[index + 1]).c_str());
+-    }
+-  }
+-  fprintf(stderr, "AERA plugins: no source could deliver %s\n", url.c_str());
+-  return false;
+-}
+-
+ bool HashFile(const std::string &path, uint64_t expected_size,
+               const std::string &expected_hash, Progress *progress,
+               unsigned progress_start = 78, unsigned progress_end = 96) {
+@@ -869,6 +846,131 @@ bool WriteFile(const std::string &path, const std::string &content) {
+   return ok;
+ }
+ 
++// The GitHub contents API answers with the file base64 encoded inside a JSON
++// envelope, and recovery can reach api.github.com where raw.githubusercontent.com
++// is filtered - this is the same host the AERA root manager updates through.
++bool Base64Decode(const std::string &text, std::string &decoded) {
++  static constexpr char kAlphabet[] =
++      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++  int table[256];
++  for (int i = 0; i < 256; ++i) table[i] = -1;
++  for (int i = 0; i < 64; ++i) table[static_cast<unsigned char>(kAlphabet[i])] = i;
++  decoded.clear();
++  decoded.reserve(text.size() * 3 / 4);
++  uint32_t buffer = 0;
++  unsigned bits = 0;
++  for (unsigned char c : text) {
++    if (c == '=' || std::isspace(c)) continue;
++    const int value = table[c];
++    if (value < 0) return false;
++    buffer = (buffer << 6) | static_cast<uint32_t>(value);
++    bits += 6;
++    if (bits >= 8) {
++      bits -= 8;
++      decoded.push_back(static_cast<char>((buffer >> bits) & 0xff));
++    }
++  }
++  return !decoded.empty() && bits < 8;
++}
++
++// Fetch one file through the contents API and leave its decoded bytes in path.
++bool DownloadApiContents(const std::string &url, const std::string &path,
++                         uint64_t limit, Progress *progress, unsigned start,
++                         unsigned end) {
++  const std::string envelope = std::string(kCacheRoot) + "/api.json";
++  const uint64_t envelope_limit = limit * 2 + 65536;
++  const bool fetched =
++      DownloadOnce(url, envelope, envelope_limit, progress, start, end, 0);
++  std::string text;
++  const bool read_ok = fetched && ReadBounded(envelope, envelope_limit, text);
++  unlink(envelope.c_str());
++  Json::Value root;
++  if (!read_ok || !ParseJson(text, root) || !root.isObject()) {
++    fprintf(stderr, "AERA plugins: contents API %s failed (download=%d, %zu B)\n",
++            HostOf(url).c_str(), fetched ? 1 : 0, text.size());
++    return false;
++  }
++  const std::string encoded = root.get("content", "").asString();
++  std::string decoded;
++  const bool decoded_ok = !encoded.empty() && Base64Decode(encoded, decoded) &&
++                          decoded.size() <= limit;
++  if (!decoded_ok) {
++    fprintf(stderr,
++            "AERA plugins: contents API %s has no usable content (%zu B, "
++            "encoding=%s, message=\"%s\")\n",
++            HostOf(url).c_str(), encoded.size(),
++            root.get("encoding", "").asString().c_str(),
++            PrintablePrefix(root.get("message", "").asString(), 60).c_str());
++    return false;
++  }
++  unlink(path.c_str());
++  return WriteFile(path, decoded);
++}
++
++// Derive the contents-API address of a raw file in the AERA-Plugins org, so the
++// same bytes can be fetched from api.github.com when raw.githubusercontent.com
++// is filtered. Owner, ref and path are preserved exactly.
++bool ApiContentsUrl(const std::string &raw_url, std::string &api_url) {
++  constexpr char prefix[] = "https://raw.githubusercontent.com/AERA-Plugins/";
++  if (raw_url.compare(0, sizeof(prefix) - 1, prefix) != 0) return false;
++  const std::string rest = raw_url.substr(sizeof(prefix) - 1);
++  const size_t repo_end = rest.find('/');
++  const size_t ref_end = repo_end == std::string::npos
++                             ? std::string::npos
++                             : rest.find('/', repo_end + 1);
++  if (repo_end == std::string::npos || ref_end == std::string::npos) return false;
++  const std::string repo = rest.substr(0, repo_end);
++  const std::string ref = rest.substr(repo_end + 1, ref_end - repo_end - 1);
++  const std::string path = rest.substr(ref_end + 1);
++  if (repo.empty() || ref.empty() || path.empty()) return false;
++  api_url = "https://api.github.com/repos/AERA-Plugins/" + repo + "/contents/" +
++            path + "?ref=" + ref;
++  return true;
++}
++
++// Try every source for one file: the contents API first (the only host the root
++// manager proves reachable from recovery), then a public mirror, then GitHub
++// itself. Whatever arrives still has to pass the caller's signature or SHA-256
++// check, so a mirror or a proxy can only ever supply identical bytes.
++bool Download(const std::string &url, const std::string &path, uint64_t limit,
++              Progress *progress = nullptr, unsigned progress_start = 0,
++              unsigned progress_end = 0, uint64_t expected_size = 0) {
++  if (!OfficialUrl(url) || limit == 0 || limit > kMaxPayload) return false;
++  struct Candidate {
++    std::string url;
++    bool contents_api;
++  };
++  std::vector<Candidate> candidates;
++  std::string api_url;
++  if (ApiContentsUrl(url, api_url)) candidates.push_back({api_url, true});
++  std::vector<std::string> mirrors;
++  AppendMirrors(url, mirrors);
++  for (const auto &mirror : mirrors) candidates.push_back({mirror, false});
++  candidates.push_back({url, false});
++  for (size_t index = 0; index < candidates.size(); ++index) {
++    if (progress && progress->cancel.load()) break;
++    const Candidate &candidate = candidates[index];
++    const bool ok = candidate.contents_api
++        ? DownloadApiContents(candidate.url, path, limit, progress,
++                              progress_start, progress_end)
++        : DownloadOnce(candidate.url, path, limit, progress, progress_start,
++                       progress_end, expected_size);
++    if (ok) {
++      if (HostOf(candidate.url) != HostOf(url)) {
++        fprintf(stderr, "AERA plugins: %s delivered by %s\n", url.c_str(),
++                HostOf(candidate.url).c_str());
++      }
++      return true;
++    }
++    if (index + 1 < candidates.size()) {
++      fprintf(stderr, "AERA plugins: %s unavailable, trying %s\n", url.c_str(),
++              HostOf(candidates[index + 1].url).c_str());
++    }
++  }
++  fprintf(stderr, "AERA plugins: no source could deliver %s\n", url.c_str());
++  return false;
++}
++
+ bool ExtractPayload(LocalBundle &bundle, const std::string &path) {
+   int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                               O_CLOEXEC, 0600);
+@@ -970,23 +1072,41 @@ bool Refresh(Progress &progress) {
+   // may still be serving a cached revision of the catalog while another has the
+   // fresh signature, and a mixed pair fails verification for no real reason.
+   // Each source is verified with the release key before it is accepted, so this
+-  // is only about reachability, never about trust. The mirror is tried first
+-  // because recovery cannot reach GitHub on some networks; the official URL
+-  // stays as the fallback.
+-  std::vector<std::string> sources;
+-  AppendMirrors(kCatalogUrl, sources);
+-  sources.push_back(kCatalogUrl);
++  // is only about reachability, never about trust. The order follows what
++  // recovery actually reaches: api.github.com first (the host the root manager
++  // proves works), then a public mirror, then GitHub itself.
++  struct CatalogSource {
++    std::string label;
++    std::string catalog;
++    std::string signature;
++    bool contents_api;
++  };
++  std::vector<CatalogSource> sources;
++  sources.push_back(
++      {HostOf(kCatalogApiUrl), kCatalogApiUrl, kCatalogApiSignatureUrl, true});
++  std::vector<std::string> mirrors;
++  AppendMirrors(kCatalogUrl, mirrors);
++  for (const auto &mirror : mirrors) {
++    sources.push_back({HostOf(mirror), mirror, mirror + kCatalogSuffix, false});
++  }
++  sources.push_back({HostOf(kCatalogUrl), kCatalogUrl,
++                     std::string(kCatalogUrl) + kCatalogSuffix, false});
+   std::string content, signature_text;
+   bool verified = false;
+   bool any_fetched = false;
+   for (size_t index = 0; index < sources.size() && !verified; ++index) {
+-    const std::string source = sources[index];
+-    const std::string signature_url = source + kCatalogSuffix;
++    const CatalogSource &source = sources[index];
+     content.clear(); signature_text.clear();
+     unlink(manifest.c_str()); unlink(signature.c_str());
+-    const bool fetched =
+-        DownloadOnce(source, manifest, kMaxCatalog, nullptr, 0, 0, 0) &&
+-        DownloadOnce(signature_url, signature, kMaxSignature, nullptr, 0, 0, 0);
++    const bool fetched = source.contents_api
++        ? (DownloadApiContents(source.catalog, manifest, kMaxCatalog, nullptr, 0,
++                               0) &&
++           DownloadApiContents(source.signature, signature, kMaxSignature,
++                               nullptr, 0, 0))
++        : (DownloadOnce(source.catalog, manifest, kMaxCatalog, nullptr, 0, 0,
++                        0) &&
++           DownloadOnce(source.signature, signature, kMaxSignature, nullptr, 0,
++                        0, 0));
+     any_fetched = any_fetched || fetched;
+     progress.value.store(45);
+     const bool read_ok =
+@@ -1004,7 +1124,7 @@ bool Refresh(Progress &progress) {
+       fprintf(stderr,
+               "AERA plugins: source %zu (%s) failed: download=%d catalog=%zu B "
+               "signature=%zu chars read=%d size=%d decode=%d prefix=\"%s\"\n",
+-              index + 1, HostOf(source).c_str(), fetched ? 1 : 0, content.size(),
++              index + 1, source.label.c_str(), fetched ? 1 : 0, content.size(),
+               TrimmedLength(signature_text), read_ok ? 1 : 0, size_ok ? 1 : 0,
+               decode_ok ? 1 : 0, PrintablePrefix(content, 24).c_str());
+     }
