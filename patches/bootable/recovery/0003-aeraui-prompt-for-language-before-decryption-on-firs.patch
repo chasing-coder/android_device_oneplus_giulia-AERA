@@ -153,10 +153,9 @@ diff --git a/aeraui/include/aeraui/engine.hpp b/aeraui/include/aeraui/engine.hpp
 index 05790e8..c07ca7d 100644
 --- a/aeraui/include/aeraui/engine.hpp
 +++ b/aeraui/include/aeraui/engine.hpp
-@@ -76,6 +76,8 @@ enum class Action {
+@@ -76,5 +76,7 @@ enum class Action {
      kStatusBar,
      kTemperatures,
-     kLockScreenshot,
 +    // Pre-decryption language prompt: the user picked a language or skipped it.
 +    kFirstBootLanguageDone,
  };
@@ -291,7 +290,7 @@ index 62ca868..c8d3342 100644
 +        DataManager::GetIntValue(kLanguageChosenPreference) != 0 ? 1 : 0;
    ApplyEarlyUiPreferences(full_ui);
    loaded = true;
-   gPrimaryWifiPreferencesLoaded = true;
+   ApplyEarlyUiSideEffects();
 @@ -3201,6 +3241,9 @@ bool SaveAeraPreferences(bool require_early) {
           << "dock_blur=" << RecoveryDockBlur() << '\n'
           << "dock_hide_apps=" << (RecoveryDockHideInApps() ? 1 : 0) << '\n'
