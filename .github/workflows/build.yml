@@ -1,13 +1,6 @@
 name: AERA Recovery 16 Builder
 
 on:
-  # One-off automatic build when this workflow configuration is committed on the test branch.
-  # Future BoardConfig changes will not launch another build automatically.
-  push:
-    branches:
-      - feature/ace5-cellular
-    paths:
-      - .github/workflows/build.yml
   workflow_dispatch:
     inputs:
       TWRP_MANIFEST_URL:
