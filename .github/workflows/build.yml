@@ -1,6 +1,13 @@
 name: AERA Recovery 16 Builder
 
 on:
+  # One-off automatic build when this workflow configuration is committed on the test branch.
+  # Future BoardConfig changes will not launch another build automatically.
+  push:
+    branches:
+      - feature/ace5-cellular
+    paths:
+      - .github/workflows/build.yml
   workflow_dispatch:
     inputs:
       TWRP_MANIFEST_URL:
@@ -14,11 +21,11 @@ on:
       DEVICE_TREE_URL:
         description: "Device tree url"
         required: true
-        default: "https://github.com/cheng343/android_device_oneplus_giulia-AERA"
+        default: "https://github.com/chasing-coder/android_device_oneplus_giulia-AERA"
       DEVICE_TREE_BRANCH:
         description: "Device tree branch"
         required: true
-        default: "aera-16.0"
+        default: "feature/ace5-cellular"
       DEVICE_PATH:
         description: "Device path device/"
         required: true
@@ -51,9 +58,9 @@ jobs:
     steps:
     - name: Show build info
       run: |
-        TARGET="${{ github.event.inputs.LUNCH_TARGET }}"
+        TARGET="${{ inputs.LUNCH_TARGET || 'giulia-bp2a-eng' }}"
         if [ -z "$TARGET" ]; then
-          TARGET="${{ github.event.inputs.DEVICE_NAME }}-bp2a-eng"
+          TARGET="${{ inputs.DEVICE_NAME || 'giulia' }}-bp2a-eng"
         fi
         TARGET="${TARGET#twrp_}"
         if [[ "$TARGET" != *-*-* ]]; then
@@ -70,14 +77,14 @@ jobs:
         {
           echo 'BUILD_INFO<<EOF'
           echo
-          echo Manifest url: ${{ github.event.inputs.TWRP_MANIFEST_URL }}
-          echo Manifest branch: ${{ github.event.inputs.TWRP_MANIFEST_BRANCH }}
-          echo Device tree url: ${{ github.event.inputs.DEVICE_TREE_URL }}
-          echo Device tree branch: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}
-          echo Device path: ${{ github.event.inputs.DEVICE_PATH }}
-          echo Device name: ${{ github.event.inputs.DEVICE_NAME }}
+          echo Manifest url: ${{ inputs.TWRP_MANIFEST_URL || 'https://github.com/AERA-Recovery/android_manifest' }}
+          echo Manifest branch: ${{ inputs.TWRP_MANIFEST_BRANCH || 'aera-16.0' }}
+          echo Device tree url: ${{ inputs.DEVICE_TREE_URL || 'https://github.com/chasing-coder/android_device_oneplus_giulia-AERA' }}
+          echo Device tree branch: ${{ inputs.DEVICE_TREE_BRANCH || 'feature/ace5-cellular' }}
+          echo Device path: ${{ inputs.DEVICE_PATH || 'oneplus/giulia' }}
+          echo Device name: ${{ inputs.DEVICE_NAME || 'giulia' }}
           echo Lunch target: ${TARGET}
-          echo Build target: ${{ github.event.inputs.BUILD_PARTITION }}.img
+          echo Build target: ${{ inputs.BUILD_PARTITION || 'recovery' }}.img
           echo Build date: `date`
           echo "Supported devices:"
           echo "- OnePlus Ace 5 / 13R (CN: PKG110 / GL: CPH2645 / IN: CPH2647)"
@@ -85,7 +92,7 @@ jobs:
           echo EOF
         } >> "$GITHUB_ENV"
         echo BUILD_DATE=`date +%F` >> "$GITHUB_ENV"
-        echo "REPO_NAME=$(basename ${{ github.event.inputs.TWRP_MANIFEST_URL }})" >> "$GITHUB_ENV"
+        echo "REPO_NAME=$(basename ${{ inputs.TWRP_MANIFEST_URL || 'https://github.com/AERA-Recovery/android_manifest' }})" >> "$GITHUB_ENV"
 
     - name: Cleanup
       uses: rokibhasansagar/slimhub_actions@main
@@ -173,7 +180,7 @@ jobs:
 
     - name: Sync source
       run: |
-        repo init -u ${{ github.event.inputs.TWRP_MANIFEST_URL }} -b ${{ github.event.inputs.TWRP_MANIFEST_BRANCH }} --depth=1
+        repo init -u ${{ inputs.TWRP_MANIFEST_URL || 'https://github.com/AERA-Recovery/android_manifest' }} -b ${{ inputs.TWRP_MANIFEST_BRANCH || 'aera-16.0' }} --depth=1
         find .repo/manifests -name "*.xml" -exec sed -i 's|ssh://git@github.com/|https://github.com/|g' {} +
         find .repo/manifests -name "*.xml" -exec sed -i 's|git@github.com:|https://github.com/|g' {} +
         grep -n "remote name=\"AERA\"" .repo/manifests/twrp-default.xml || true
@@ -187,13 +194,13 @@ jobs:
 
     - name: Setup device
       run: |
-        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} device/${{ github.event.inputs.DEVICE_PATH }}
+        git clone ${{ inputs.DEVICE_TREE_URL || 'https://github.com/chasing-coder/android_device_oneplus_giulia-AERA' }} -b ${{ inputs.DEVICE_TREE_BRANCH || 'feature/ace5-cellular' }} device/${{ inputs.DEVICE_PATH || 'oneplus/giulia' }}
 
     - name: Apply device patches
       run: |
         set -euo pipefail
         shopt -s nullglob
-        PATCH_ROOT="$PWD/device/${{ github.event.inputs.DEVICE_PATH }}/patches"
+        PATCH_ROOT="$PWD/device/${{ inputs.DEVICE_PATH || 'oneplus/giulia' }}/patches"
         # Patches are grouped by the project they patch:
         #   patches/bootable/recovery/*.patch -> applied in bootable/recovery
         #   patches/vendor/recovery/*.patch   -> applied in vendor/recovery
@@ -235,7 +242,7 @@ jobs:
           git log --pretty=format:"- %h-%an: %s" >> INFO.txt
         fi
         cat INFO.txt
-      working-directory: device/${{ github.event.inputs.DEVICE_PATH }}
+      working-directory: device/${{ inputs.DEVICE_PATH || 'oneplus/giulia' }}
 
     - name: Open telemetry issue
       env:
@@ -386,7 +393,7 @@ jobs:
         ) > "$RUNNER_TEMP/telemetry-stdout.log" 2>&1 &
         TIP_PID=$!
         set +e
-        mka adbd ${{ github.event.inputs.BUILD_PARTITION }}image 2>&1 | tee -a "$BUILD_LOG"
+        mka adbd ${{ inputs.BUILD_PARTITION || 'recovery' }}image 2>&1 | tee -a "$BUILD_LOG"
         BUILD_RC=${PIPESTATUS[0]}
         set -e
         kill $TIP_PID 2>/dev/null || true
@@ -420,11 +427,11 @@ jobs:
           exit 1
         fi
         if [ $BUILD_RC -ne 0 ]; then
-          echo "::error::m ${{ github.event.inputs.BUILD_PARTITION }}image failed with exit code $BUILD_RC"
+          echo "::error::m ${{ inputs.BUILD_PARTITION || 'recovery' }}image failed with exit code $BUILD_RC"
           exit $BUILD_RC
         fi
         mkdir -p out/artifacts
-        find out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ -maxdepth 1 \( -name "*.img" -o -name "*.zip" \) -exec cp {} out/artifacts/ \;
+        find out/target/product/${{ inputs.DEVICE_NAME || 'giulia' }}/ -maxdepth 1 \( -name "*.img" -o -name "*.zip" \) -exec cp {} out/artifacts/ \;
         ls -l out/artifacts/
 
     - name: Produce AVB-transplanted variant
@@ -438,10 +445,10 @@ jobs:
       continue-on-error: true
       run: |
         set -x
-        DEV=device/${{ github.event.inputs.DEVICE_PATH }}
-        IMG=out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_PARTITION }}.img
+        DEV=device/${{ inputs.DEVICE_PATH || 'oneplus/giulia' }}
+        IMG=out/target/product/${{ inputs.DEVICE_NAME || 'giulia' }}/${{ inputs.BUILD_PARTITION || 'recovery' }}.img
         VB="$DEV/avb/recovery-vbmeta.bin"
-        BASE=AERA-Recovery-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}
+        BASE=AERA-Recovery-${{ inputs.DEVICE_NAME || 'giulia' }}-${{ env.BUILD_DATE }}
         ls -l "$IMG" "$VB"
         cp "$IMG" "out/artifacts/${BASE}-aosp-signed.img"
         python3 "$DEV/tools/transplant_avb.py" "$VB" "$IMG" "out/artifacts/${BASE}-avb-oem.img"
@@ -486,7 +493,7 @@ jobs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: AERA-Recovery-${{ github.event.inputs.DEVICE_NAME }}
+        name: AERA-Recovery-${{ inputs.DEVICE_NAME || 'giulia' }}
         path: out/artifacts/*
 
     - name: Upload to Release
@@ -498,8 +505,8 @@ jobs:
         draft: true
         files: | 
           out/artifacts/*
-        name: AERA-Recovery-16.0-${{ github.event.inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}
+        name: AERA-Recovery-16.0-${{ inputs.DEVICE_NAME || 'giulia' }}-${{ env.BUILD_DATE }}
         tag_name: ${{ env.BUILD_DATE }}-${{ github.run_id }}
-        body_path: device/${{ github.event.inputs.DEVICE_PATH }}/INFO.txt
+        body_path: device/${{ inputs.DEVICE_PATH || 'oneplus/giulia' }}/INFO.txt
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
