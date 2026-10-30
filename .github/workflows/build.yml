@@ -181,6 +181,16 @@ jobs:
         TIP_PID=$!
         repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune || repo sync -c -j4
         kill $TIP_PID 2>/dev/null || true
+        # The device tree carries an ordered 8-patch recovery series authored
+        # against this upstream commit. Later AERA WLAN/DHCP/plugin updates
+        # changed the hunk context and make git apply fail.
+        # Pin only bootable/recovery for this testing branch, not the manifest.
+        RECOVERY_BASE=cdc5c3dcf9db99987f78c6743c19429b5c7c83b3
+        git -C bootable/recovery fetch --no-tags --depth=1 \
+          https://github.com/AERA-Recovery/android_bootable_recovery.git "$RECOVERY_BASE"
+        git -C bootable/recovery checkout --detach "$RECOVERY_BASE"
+        test "$(git -C bootable/recovery rev-parse HEAD)" = "$RECOVERY_BASE"
+        echo "Pinned bootable/recovery to $RECOVERY_BASE for device patch compatibility"
         echo "Removing .repo cache to free up ~20GB of disk space..."
         rm -rf .repo
         df -h
